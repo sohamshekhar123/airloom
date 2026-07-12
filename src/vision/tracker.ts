@@ -53,11 +53,10 @@ export function detectHands(
   for (let i = 0; i < result.landmarks.length; i++) {
     const handedness = result.handedness[i]?.[0];
     if (!handedness) continue;
-    // MediaPipe labels handedness assuming a mirrored (selfie) image, but
-    // getUserMedia frames are raw. Net effect: the model's "Left" is the
-    // user's right hand. We also mirror x so coordinates match the
+    // Verified live: the model's label matches the user's actual hand when
+    // fed raw getUserMedia frames. We mirror x so coordinates match the
     // mirrored video the user sees.
-    const side = handedness.categoryName === "Left" ? "right" : "left";
+    const side = handedness.categoryName === "Left" ? "left" : "right";
     hands.push({
       side,
       confidence: handedness.score,

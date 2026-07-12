@@ -1,108 +1,157 @@
 /**
  * Turns raw hand landmarks into musical intent.
  *
- * Two parallel paths (this is the core latency design):
- *  - CONTINUOUS path: One Euro-filtered positions -> chord voicing, brightness.
- *    Routed only to slow-attack sounds, where ~60ms of camera lag is inaudible.
- *  - TRIGGER path: raw 3-frame velocity + Schmitt trigger -> strikes.
- *    Strikes are quantized to the audio clock's next grid slot, so they
- *    always LAND perfectly in time regardless of camera latency.
+ * RIGHT HAND — The Performer (coral):
+ *   openness (fist..splayed)  -> volume, continuous
+ *   x position                -> rhythm rate (hold / 1/2 / 1/4 / 1/8 / 1/16)
+ *   y position                -> vibrato (pitch modulation), up = more
+ *   z push toward camera      -> advance to the next chord (invisible button)
+ *
+ * LEFT HAND — The Conductor (mint):
+ *   y position                -> chord richness (bass / chord / lush)
+ *   pinch (thumb+index) held  -> y sets note velocity instead; the value
+ *                                LATCHES when the pinch releases
+ *
+ * All continuous controls are One Euro-filtered; discrete events (chord
+ * push) use raw data + hysteresis so they stay snappy.
  */
 import { LM, type TrackedHand } from "../vision/tracker";
 import { OneEuroFilter } from "../vision/oneEuro";
-import type { VoicingLevel } from "../music/moods";
+import type { VoicingLevel } from "../music/progressions";
 
-/** User-view layout: left 35% = harmony zone, right 65% = three trigger lanes. */
 export const HARMONY_ZONE_MAX_X = 0.35;
-export type Lane = "arp" | "chord" | "drum";
+
+export const RATE_LABELS = ["HOLD", "1/2", "1/4", "1/8", "1/16"] as const;
+
+export interface RightHandFrame {
+  /** 0..1 — closed fist to fully open */
+  openness: number;
+  /** 0..4 index into RATE_LABELS */
+  rateIndex: number;
+  /** 0..1 raw horizontal position within the performance zone (for HUD) */
+  rateT: number;
+  /** 0..1 vibrato amount */
+  vibrato: number;
+  /** 0..1 how far into the chord-push the hand is (for HUD feedback) */
+  pushProgress: number;
+  /** true exactly once per push gesture */
+  pushed: boolean;
+  /** wrist position in mirrored screen space (for HUD) */
+  x: number;
+  y: number;
+}
+
+export interface LeftHandFrame {
+  /** 0..1 hand height (up = 1) */
+  height: number;
+  voicing: VoicingLevel;
+  pinching: boolean;
+  /** 0..1 latched note velocity */
+  velocity: number;
+  x: number;
+  y: number;
+}
 
 export interface GestureFrame {
-  /** null when the left hand isn't visible */
-  harmony: {
-    /** 0 (bottom, bass only) .. 2 (top, lush extensions) */
-    voicing: VoicingLevel;
-    /** 0..1 continuous height for filter brightness */
-    height: number;
-    /** closed fist = dampen everything */
-    fist: boolean;
-  } | null;
-  /** Strike fired THIS frame (already debounced), null otherwise */
-  strike: { lane: Lane; velocity: number } | null;
-  /** Which lane the right hand is hovering, for UI highlighting */
-  hoverLane: Lane | null;
-  /** 0..1 rough tracking quality for the status dot */
+  right: RightHandFrame | null;
+  left: LeftHandFrame | null;
   quality: number;
 }
 
-const STRIKE_ARM_THRESHOLD = 1.1; // normalized units/sec, downward
-const STRIKE_REARM_THRESHOLD = 0.35;
-const STRIKE_MIN_INTERVAL_MS = 120; // hard debounce
-
-export function laneForX(x: number): Lane {
-  // Right 65% of user view, split into three columns
-  const t = (x - HARMONY_ZONE_MAX_X) / (1 - HARMONY_ZONE_MAX_X);
-  if (t < 1 / 3) return "arp";
-  if (t < 2 / 3) return "chord";
-  return "drum";
-}
+const PUSH_TRIGGER = 1.3; // hand scale ratio vs baseline to fire
+const PUSH_REARM = 1.12;
+const PUSH_DEBOUNCE_MS = 500;
 
 export class GestureInterpreter {
-  private leftYFilter = new OneEuroFilter(1.2, 0.01);
-  private velWindow: { y: number; t: number }[] = [];
-  private armed = true;
-  private lastStrikeAt = 0;
+  private rOpen = new OneEuroFilter(1.5, 0.02);
+  private rX = new OneEuroFilter(1.2, 0.01);
+  private rY = new OneEuroFilter(1.2, 0.01);
+  private lY = new OneEuroFilter(1.2, 0.01);
+
+  private scaleBaseline: number | null = null;
+  private pushArmed = true;
+  private lastPushAt = 0;
+
+  private latchedVelocity = 0.8;
 
   update(hands: TrackedHand[], nowMs: number): GestureFrame {
     const t = nowMs / 1000;
-    const left = hands.find((h) => h.side === "left");
-    const right = hands.find((h) => h.side === "right");
+    const leftHand = hands.find((h) => h.side === "left");
+    const rightHand = hands.find((h) => h.side === "right");
 
-    // ---- Continuous path: left hand = The Conductor ----
-    let harmony: GestureFrame["harmony"] = null;
-    if (left && left.landmarks[LM.WRIST].x < HARMONY_ZONE_MAX_X + 0.12) {
-      const rawY = left.landmarks[LM.WRIST].y;
-      const y = this.leftYFilter.filter(rawY, t);
-      const height = 1 - Math.min(Math.max(y, 0), 1); // up = more
-      const voicing: VoicingLevel = height > 0.66 ? 2 : height > 0.33 ? 1 : 0;
-      harmony = { voicing, height, fist: isFist(left) };
+    // ------------------------- RIGHT: The Performer -------------------------
+    let right: RightHandFrame | null = null;
+    if (rightHand) {
+      const lm = rightHand.landmarks;
+      const wrist = lm[LM.WRIST];
+
+      const openness = this.rOpen.filter(handOpenness(rightHand), t);
+      const x = this.rX.filter(wrist.x, t);
+      const y = this.rY.filter(wrist.y, t);
+
+      // x -> rhythm rate across the performance zone
+      const rateT = clamp01((x - HARMONY_ZONE_MAX_X) / (1 - HARMONY_ZONE_MAX_X));
+      const rateIndex = Math.min(Math.floor(rateT * 5), 4);
+
+      // y -> vibrato, dead zone in the lower half so resting = clean
+      const vibrato = clamp01((0.55 - y) / 0.45);
+
+      // z push: apparent hand size vs slow-adapting baseline
+      const scale = handScale(rightHand);
+      if (this.scaleBaseline === null) this.scaleBaseline = scale;
+      const ratio = scale / this.scaleBaseline;
+      // adapt baseline only when the hand is near rest depth
+      if (ratio < 1.1 && ratio > 0.85) {
+        this.scaleBaseline += (scale - this.scaleBaseline) * 0.03;
+      }
+      const pushProgress = clamp01((ratio - 1) / (PUSH_TRIGGER - 1));
+      let pushed = false;
+      if (
+        this.pushArmed &&
+        ratio > PUSH_TRIGGER &&
+        nowMs - this.lastPushAt > PUSH_DEBOUNCE_MS
+      ) {
+        pushed = true;
+        this.pushArmed = false;
+        this.lastPushAt = nowMs;
+      } else if (!this.pushArmed && ratio < PUSH_REARM) {
+        this.pushArmed = true;
+      }
+
+      right = { openness, rateIndex, rateT, vibrato, pushProgress, pushed, x, y };
     } else {
-      this.leftYFilter.reset();
+      this.rOpen.reset();
+      this.rX.reset();
+      this.rY.reset();
+      this.scaleBaseline = null;
+      this.pushArmed = true;
     }
 
-    // ---- Trigger path: right hand = The Performer ----
-    let strike: GestureFrame["strike"] = null;
-    let hoverLane: Lane | null = null;
-    if (right) {
-      const wrist = right.landmarks[LM.WRIST];
-      if (wrist.x >= HARMONY_ZONE_MAX_X) {
-        hoverLane = laneForX(wrist.x);
-      }
+    // ------------------------- LEFT: The Conductor -------------------------
+    let left: LeftHandFrame | null = null;
+    if (leftHand) {
+      const lm = leftHand.landmarks;
+      const wrist = lm[LM.WRIST];
+      const y = this.lY.filter(wrist.y, t);
+      const height = 1 - clamp01(y);
+      const pinching = isPinching(leftHand);
 
-      // Downward velocity over a ~3-frame window (raw, unfiltered — speed matters)
-      this.velWindow.push({ y: wrist.y, t });
-      if (this.velWindow.length > 3) this.velWindow.shift();
-      if (this.velWindow.length === 3 && hoverLane) {
-        const a = this.velWindow[0];
-        const b = this.velWindow[2];
-        const vy = (b.y - a.y) / Math.max(b.t - a.t, 1e-6); // + = downward
-
-        // Schmitt trigger: fire once on crossing, re-arm only after slowing down
-        if (
-          this.armed &&
-          vy > STRIKE_ARM_THRESHOLD &&
-          nowMs - this.lastStrikeAt > STRIKE_MIN_INTERVAL_MS
-        ) {
-          this.armed = false;
-          this.lastStrikeAt = nowMs;
-          const velocity = Math.min(0.4 + ((vy - STRIKE_ARM_THRESHOLD) / 2.5) * 0.6, 1);
-          strike = { lane: hoverLane, velocity };
-        } else if (!this.armed && vy < STRIKE_REARM_THRESHOLD) {
-          this.armed = true;
-        }
+      if (pinching) {
+        // While pinched, height DIALS velocity; it stays after release.
+        this.latchedVelocity = 0.15 + height * 0.85;
       }
+      const voicing: VoicingLevel = height > 0.66 ? 2 : height > 0.33 ? 1 : 0;
+
+      left = {
+        height,
+        voicing,
+        pinching,
+        velocity: this.latchedVelocity,
+        x: wrist.x,
+        y,
+      };
     } else {
-      this.velWindow.length = 0;
-      this.armed = true;
+      this.lY.reset();
     }
 
     const quality =
@@ -110,25 +159,44 @@ export class GestureInterpreter {
         ? 0
         : hands.reduce((s, h) => s + h.confidence, 0) / hands.length;
 
-    return { harmony, strike, hoverLane, quality };
+    return { right, left, quality };
   }
 }
 
-/** Fist heuristic: all four fingertips folded below their middle knuckles. */
-function isFist(hand: TrackedHand): boolean {
+/* ------------------------------- heuristics ------------------------------- */
+
+const clamp01 = (v: number) => Math.min(Math.max(v, 0), 1);
+
+/** Palm size in screen units — grows as the hand nears the camera. */
+function handScale(hand: TrackedHand): number {
   const lm = hand.landmarks;
   const wrist = lm[LM.WRIST];
-  const pairs: [number, number][] = [
-    [LM.INDEX_TIP, LM.INDEX_PIP],
-    [LM.MIDDLE_TIP, LM.MIDDLE_PIP],
-    [LM.RING_TIP, LM.RING_PIP],
-    [LM.PINKY_TIP, LM.PINKY_PIP],
-  ];
-  let folded = 0;
-  for (const [tip, pip] of pairs) {
-    const dTip = Math.hypot(lm[tip].x - wrist.x, lm[tip].y - wrist.y);
-    const dPip = Math.hypot(lm[pip].x - wrist.x, lm[pip].y - wrist.y);
-    if (dTip < dPip) folded++;
+  const mcp = lm[9]; // middle finger MCP
+  return Math.hypot(mcp.x - wrist.x, mcp.y - wrist.y);
+}
+
+/** 0 = fist, 1 = fully splayed. Fingertip spread normalized by palm size. */
+function handOpenness(hand: TrackedHand): number {
+  const lm = hand.landmarks;
+  const wrist = lm[LM.WRIST];
+  const scale = handScale(hand) || 1e-6;
+  const tips = [LM.INDEX_TIP, LM.MIDDLE_TIP, LM.RING_TIP, LM.PINKY_TIP];
+  let sum = 0;
+  for (const tip of tips) {
+    sum += Math.hypot(lm[tip].x - wrist.x, lm[tip].y - wrist.y);
   }
-  return folded >= 3;
+  const avg = sum / tips.length / scale;
+  // fist ≈ 0.9, open ≈ 1.9 (empirically stable across hand sizes)
+  return clamp01((avg - 0.95) / 0.95);
+}
+
+/** Thumb tip touching index tip, normalized by palm size. */
+function isPinching(hand: TrackedHand): boolean {
+  const lm = hand.landmarks;
+  const scale = handScale(hand) || 1e-6;
+  const d = Math.hypot(
+    lm[LM.THUMB_TIP].x - lm[LM.INDEX_TIP].x,
+    lm[LM.THUMB_TIP].y - lm[LM.INDEX_TIP].y,
+  );
+  return d / scale < 0.4;
 }

@@ -1,62 +1,83 @@
 /**
- * UI state only. High-frequency data (landmarks, velocities) NEVER goes
- * through React — it stays in refs and canvas draws. This store holds the
- * slow, discrete stuff the UI actually re-renders on.
+ * UI state only. High-frequency data (landmarks) never touches React — it
+ * flows ref -> canvas -> audio. This store holds the slow, discrete state
+ * the top bar re-renders on; continuous values are rounded before writing
+ * so 60Hz hand motion doesn't become 60Hz React renders.
  */
 import { create } from "zustand";
-import { MOODS, type Mood } from "../music/moods";
+import { PROGRESSIONS } from "../music/progressions";
 
 export type Screen = "welcome" | "loading" | "stage" | "error";
 
-interface AirloomState {
+interface PerfSnapshot {
+  rightOn: boolean;
+  leftOn: boolean;
+  volume: number; // 0..1, rounded to 0.05
+  rate: number; // 0..4
+  vibrato: number; // 0..1, rounded to 0.05
+  voicing: number; // 0..2
+  velocity: number; // 0..1, rounded to 0.05
+  pinching: boolean;
+  quality: number; // rounded to 0.2
+}
+
+interface AirloomState extends PerfSnapshot {
   screen: Screen;
   errorMessage: string;
-  mood: Mood;
+  progressionId: string;
+  instrumentId: string;
+  instrumentLoading: boolean;
+  bpm: number;
   playing: boolean;
   chordName: string;
-  beat: number;
-  hoverLane: string | null;
-  voicing: number;
-  muted: boolean;
-  quality: number;
+  chordStep: number;
 
   setScreen: (s: Screen, error?: string) => void;
-  setMood: (m: Mood) => void;
-  setPlaying: (p: boolean) => void;
-  setChord: (name: string) => void;
-  setBeat: (b: number) => void;
-  setPerformance: (p: {
-    hoverLane: string | null;
-    voicing: number;
-    muted: boolean;
-    quality: number;
-  }) => void;
+  setPerf: (p: PerfSnapshot) => void;
+  setChord: (name: string, step: number) => void;
 }
+
+const round = (v: number, q: number) => Math.round(v / q) * q;
 
 export const useStore = create<AirloomState>((set) => ({
   screen: "welcome",
   errorMessage: "",
-  mood: MOODS[0],
+  progressionId: PROGRESSIONS[0].id,
+  instrumentId: "piano",
+  instrumentLoading: false,
+  bpm: 100,
   playing: false,
   chordName: "",
-  beat: 0,
-  hoverLane: null,
+  chordStep: 0,
+
+  rightOn: false,
+  leftOn: false,
+  volume: 0,
+  rate: 2,
+  vibrato: 0,
   voicing: 1,
-  muted: false,
+  velocity: 0.8,
+  pinching: false,
   quality: 0,
 
   setScreen: (screen, errorMessage = "") => set({ screen, errorMessage }),
-  setMood: (mood) => set({ mood }),
-  setPlaying: (playing) => set({ playing }),
-  setChord: (chordName) => set({ chordName }),
-  setBeat: (beat) => set({ beat }),
-  setPerformance: (p) =>
-    set((s) =>
-      s.hoverLane === p.hoverLane &&
-      s.voicing === p.voicing &&
-      s.muted === p.muted &&
-      Math.abs(s.quality - p.quality) < 0.15
-        ? s
-        : p,
-    ),
+  setChord: (chordName, chordStep) => set({ chordName, chordStep }),
+  setPerf: (p) =>
+    set((s) => {
+      const next: PerfSnapshot = {
+        rightOn: p.rightOn,
+        leftOn: p.leftOn,
+        volume: round(p.volume, 0.05),
+        rate: p.rate,
+        vibrato: round(p.vibrato, 0.05),
+        voicing: p.voicing,
+        velocity: round(p.velocity, 0.05),
+        pinching: p.pinching,
+        quality: round(p.quality, 0.2),
+      };
+      for (const k of Object.keys(next) as (keyof PerfSnapshot)[]) {
+        if (next[k] !== s[k]) return next;
+      }
+      return s;
+    }),
 }));

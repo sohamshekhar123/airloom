@@ -1,225 +1,277 @@
 /**
  * Airloom's sound engine, built on Tone.js.
  *
- * The master clock is the AUDIO clock (Tone.Transport on AudioContext time),
- * never a JS timer. Strikes from the camera are scheduled at the next 16th-note
- * grid slot — "commit-ahead scheduling" — so every hit lands sample-accurately
- * on the beat no matter how laggy the webcam is. Camera latency becomes
- * musically invisible instead of musically fatal.
+ * The instrument is a continuous PATTERN PLAYER conducted by the hands:
+ * a 16th-note tick on the audio clock decides, each slot, whether to sound
+ * notes of the current chord — at the rate, volume, velocity, richness and
+ * vibrato the hands are currently expressing. The master clock is the
+ * AUDIO clock (Tone.Transport), never a JS timer, so everything stays in time
+ * regardless of camera latency.
+ *
+ * Instruments are real sampled instruments (Tone.Sampler over CDN-hosted
+ * sample sets), with a synth fallback that needs no network.
  */
 import * as Tone from "tone";
 import {
-  MOODS,
+  PROGRESSIONS,
   midiToFreq,
   voiceChord,
-  type Mood,
+  type Progression,
   type VoicingLevel,
-} from "../music/moods";
-import type { Lane } from "../gestures/interpreter";
+} from "../music/progressions";
 
-export type BeatCallback = (beatInBar: number) => void;
-export type ChordCallback = (chordName: string, index: number) => void;
+export interface InstrumentDef {
+  id: string;
+  label: string;
+}
+
+export const INSTRUMENTS: InstrumentDef[] = [
+  { id: "piano", label: "Grand Piano" },
+  { id: "guitar", label: "Acoustic Guitar" },
+  { id: "violin", label: "Violin" },
+  { id: "dream", label: "Dream Synth" },
+];
+
+const SAMPLE_SETS: Record<string, { baseUrl: string; urls: Record<string, string> }> = {
+  piano: {
+    baseUrl: "https://tonejs.github.io/audio/salamander/",
+    urls: {
+      A1: "A1.mp3", A2: "A2.mp3", A3: "A3.mp3", A4: "A4.mp3", A5: "A5.mp3",
+      C2: "C2.mp3", C3: "C3.mp3", C4: "C4.mp3", C5: "C5.mp3", C6: "C6.mp3",
+      "F#2": "Fs2.mp3", "F#3": "Fs3.mp3", "F#4": "Fs4.mp3",
+    },
+  },
+  guitar: {
+    baseUrl: "https://nbrosowsky.github.io/tonejs-instruments/samples/guitar-acoustic/",
+    urls: {
+      E2: "E2.mp3", A2: "A2.mp3", C3: "C3.mp3", E3: "E3.mp3",
+      A3: "A3.mp3", C4: "C4.mp3", E4: "E4.mp3", G4: "G4.mp3",
+    },
+  },
+  violin: {
+    baseUrl: "https://nbrosowsky.github.io/tonejs-instruments/samples/violin/",
+    urls: {
+      A3: "A3.mp3", C4: "C4.mp3", E4: "E4.mp3", G4: "G4.mp3",
+      A4: "A4.mp3", C5: "C5.mp3", E5: "E5.mp3", G5: "G5.mp3",
+    },
+  },
+};
+
+/** 16th-note steps between notes for each rate setting. */
+const STEPS_PER_RATE = [16, 8, 4, 2, 1]; // HOLD, 1/2, 1/4, 1/8, 1/16
+
+type Playable = Tone.Sampler | Tone.PolySynth;
 
 class AirloomEngine {
   private started = false;
-  private mood: Mood = MOODS[0];
+  private progression: Progression = PROGRESSIONS[0];
   private chordIndex = 0;
+
+  // hand-driven expression (written every frame, read on audio ticks)
+  private volume = 0; // 0..1 from right-hand openness
+  private rateIndex = 2;
   private voicing: VoicingLevel = 1;
-  private muted = false;
+  private velocity = 0.8;
 
-  private pad!: Tone.PolySynth;
-  private stab!: Tone.PolySynth;
-  private arpSynth!: Tone.Synth;
-  private kick!: Tone.MembraneSynth;
-  private clap!: Tone.NoiseSynth;
-  private hat!: Tone.NoiseSynth;
-  private padFilter!: Tone.Filter;
-  private padVolume!: Tone.Volume;
+  private step = 0;
+  private arpIdx = 0;
+  private wasAudible = false;
+  private chordDirty = false;
 
-  onBeat: BeatCallback | null = null;
-  onChord: ChordCallback | null = null;
+  private instruments = new Map<string, Playable>();
+  private current: Playable | null = null;
+  private currentId = "";
+
+  private vibrato!: Tone.Vibrato;
+  private gate!: Tone.Gain;
+
+  onChord: ((name: string, index: number) => void) | null = null;
+  onBeat: ((beat: number) => void) | null = null;
 
   /** Must be called from a user gesture (browser autoplay policy). */
-  async start(): Promise<void> {
+  async start(defaultInstrument = "piano"): Promise<void> {
     if (this.started) return;
     await Tone.start();
 
-    const reverb = new Tone.Reverb({ decay: 4, wet: 0.35 }).toDestination();
-    const limiter = new Tone.Limiter(-3).connect(reverb);
+    const reverb = new Tone.Reverb({ decay: 3.2, wet: 0.28 }).toDestination();
+    const limiter = new Tone.Limiter(-2).connect(reverb);
+    const trim = new Tone.Volume(-4).connect(limiter);
+    this.gate = new Tone.Gain(0).connect(trim);
+    this.vibrato = new Tone.Vibrato(5, 0).connect(this.gate);
 
-    this.padFilter = new Tone.Filter(1200, "lowpass").connect(limiter);
-    this.padVolume = new Tone.Volume(-8).connect(this.padFilter);
-    this.pad = new Tone.PolySynth(Tone.Synth, {
-      oscillator: { type: "fatsawtooth", count: 3, spread: 24 },
-      envelope: { attack: 0.6, decay: 0.4, sustain: 0.7, release: 2.2 },
-    }).connect(this.padVolume);
-    this.pad.maxPolyphony = 12;
-
-    this.stab = new Tone.PolySynth(Tone.Synth, {
-      oscillator: { type: "triangle" },
-      envelope: { attack: 0.005, decay: 0.35, sustain: 0.1, release: 0.6 },
-      volume: -6,
-    }).connect(limiter);
-    this.stab.maxPolyphony = 12;
-
-    this.arpSynth = new Tone.Synth({
-      oscillator: { type: "square" },
-      envelope: { attack: 0.003, decay: 0.18, sustain: 0.02, release: 0.25 },
-      volume: -10,
-    }).connect(
-      new Tone.PingPongDelay({ delayTime: "8n", feedback: 0.3, wet: 0.3 }).connect(
-        limiter,
-      ),
-    );
-
-    this.kick = new Tone.MembraneSynth({
-      pitchDecay: 0.04,
-      octaves: 7,
-      envelope: { attack: 0.001, decay: 0.45, sustain: 0 },
-      volume: -2,
-    }).connect(limiter);
-
-    this.clap = new Tone.NoiseSynth({
-      noise: { type: "pink" },
-      envelope: { attack: 0.002, decay: 0.18, sustain: 0 },
-      volume: -8,
-    }).connect(limiter);
-
-    this.hat = new Tone.NoiseSynth({
-      noise: { type: "white" },
-      envelope: { attack: 0.001, decay: 0.05, sustain: 0 },
-      volume: -16,
-    }).connect(limiter);
-
-    // Chord changes every bar; beat pulse every quarter for the UI.
-    Tone.getTransport().scheduleRepeat((time) => {
-      this.chordIndex = (this.chordIndex + 1) % this.mood.progression.length;
-      this.playPadChord(time);
-      const name = this.mood.progression[this.chordIndex].name;
-      const idx = this.chordIndex;
-      Tone.getDraw().schedule(() => this.onChord?.(name, idx), time);
-    }, "1m", "1m");
-
-    Tone.getTransport().scheduleRepeat((time) => {
-      const pos = Tone.getTransport().position.toString();
-      const beat = parseInt(pos.split(":")[1] ?? "0", 10);
+    const transport = Tone.getTransport();
+    transport.scheduleRepeat((time) => this.tick(time), "16n");
+    transport.scheduleRepeat((time) => {
+      const beat = parseInt(transport.position.toString().split(":")[1] ?? "0", 10);
       Tone.getDraw().schedule(() => this.onBeat?.(beat), time);
     }, "4n");
 
+    await this.setInstrument(defaultInstrument);
     this.started = true;
   }
 
-  play(): void {
-    if (!this.started) return;
-    Tone.getTransport().bpm.value = this.mood.bpm;
+  play(bpm: number): void {
+    Tone.getTransport().bpm.value = bpm;
     Tone.getTransport().start();
-    this.chordIndex = 0;
-    this.playPadChord(Tone.now() + 0.05);
-    this.onChord?.(this.mood.progression[0].name, 0);
+    this.onChord?.(this.progression.chords[this.chordIndex].name, this.chordIndex);
   }
 
-  stop(): void {
-    Tone.getTransport().stop();
-    Tone.getTransport().cancel(0);
-    this.pad?.releaseAll();
-    this.started = false; // force re-schedule of repeats on next start
+  pause(): void {
+    Tone.getTransport().pause();
+    this.releaseAll();
   }
 
   get isRunning(): boolean {
-    return this.started && Tone.getTransport().state === "started";
+    return Tone.getTransport().state === "started";
   }
 
-  setMood(mood: Mood): void {
-    this.mood = mood;
+  setBpm(bpm: number): void {
+    Tone.getTransport().bpm.rampTo(bpm, 0.4);
+  }
+
+  setProgression(p: Progression): void {
+    this.progression = p;
     this.chordIndex = 0;
-    if (this.isRunning) {
-      Tone.getTransport().bpm.rampTo(mood.bpm, 1);
-      this.playPadChord(Tone.now() + 0.05);
-      this.onChord?.(mood.progression[0].name, 0);
-    }
+    this.chordDirty = true;
+    this.onChord?.(p.chords[0].name, 0);
   }
 
-  get currentMood(): Mood {
-    return this.mood;
+  /** The invisible button: right hand pushes toward the camera. */
+  advanceChord(): void {
+    this.chordIndex = (this.chordIndex + 1) % this.progression.chords.length;
+    this.chordDirty = true;
+    this.arpIdx = 0;
+    this.onChord?.(this.progression.chords[this.chordIndex].name, this.chordIndex);
   }
 
-  /** Left hand height -> voicing complexity + pad brightness. Continuous path. */
-  setHarmony(voicing: VoicingLevel, height: number): void {
+  /** Continuous, called every video frame from the gesture loop. */
+  setExpression(volume: number, rateIndex: number, vibratoAmt: number): void {
     if (!this.started) return;
-    // Brightness sweeps 300Hz..6kHz with height — slow-attack sound masks latency
-    this.padFilter.frequency.rampTo(300 + height * 5700, 0.08);
-    if (voicing !== this.voicing) {
-      this.voicing = voicing;
-      if (this.isRunning && !this.muted) this.playPadChord(Tone.now() + 0.02);
+    this.volume = volume;
+    this.rateIndex = rateIndex;
+    // perceptual volume curve; fully closed fist is silence
+    const gain = volume < 0.06 ? 0 : Math.pow(volume, 1.6);
+    this.gate.gain.rampTo(gain, 0.09);
+    this.vibrato.depth.rampTo(vibratoAmt * 0.45, 0.12);
+  }
+
+  setVoicing(v: VoicingLevel): void {
+    if (v !== this.voicing) {
+      this.voicing = v;
+      this.chordDirty = true; // re-voice held chords at the next slot
     }
   }
 
-  /** Closed fist = dampen. Opening = swell back. */
-  setMuted(muted: boolean): void {
-    if (!this.started || muted === this.muted) return;
-    this.muted = muted;
-    if (muted) {
-      this.pad.releaseAll();
-      this.padVolume.volume.rampTo(-40, 0.15);
-    } else {
-      this.padVolume.volume.rampTo(-8, 0.4);
-      if (this.isRunning) this.playPadChord(Tone.now() + 0.02);
-    }
+  setVelocity(v: number): void {
+    this.velocity = v;
   }
 
-  /**
-   * Commit-ahead scheduling: fire at the next 16th-note grid slot on the
-   * audio clock. Returns the delay (ms) until it sounds, for UI feedback.
-   */
-  strike(lane: Lane, velocity: number): number {
-    if (!this.started) return 0;
-    if (!this.isRunning) {
-      this.triggerLane(lane, velocity, Tone.now());
-      return 0;
+  async setInstrument(id: string): Promise<void> {
+    if (id === this.currentId) return;
+    let inst = this.instruments.get(id);
+    if (!inst) {
+      inst = await this.createInstrument(id);
+      this.instruments.set(id, inst);
     }
-    const transport = Tone.getTransport();
-    const gridTime = transport.nextSubdivision("16n");
-    transport.scheduleOnce((time) => this.triggerLane(lane, velocity, time), gridTime);
-    return Math.max(0, (gridTime - transport.seconds) * 1000);
+    this.releaseAll();
+    this.current?.disconnect();
+    this.current = inst;
+    this.currentId = id;
+    inst.connect(this.vibrato);
   }
 
-  private triggerLane(lane: Lane, velocity: number, time: number): void {
-    const chordDef = this.mood.progression[this.chordIndex];
-    if (lane === "drum") {
-      this.kick.triggerAttackRelease("C1", "8n", time, velocity);
-      this.hat.triggerAttackRelease("16n", time + 0.001, velocity * 0.7);
-      if (velocity > 0.7) {
-        this.clap.triggerAttackRelease("8n", time + 0.002, velocity);
+  get instrumentId(): string {
+    return this.currentId;
+  }
+
+  private async createInstrument(id: string): Promise<Playable> {
+    if (id === "dream") {
+      const synth = new Tone.PolySynth(Tone.Synth, {
+        oscillator: { type: "fatsawtooth", count: 3, spread: 22 },
+        envelope: { attack: 0.04, decay: 0.3, sustain: 0.6, release: 1.6 },
+        volume: -8,
+      });
+      synth.maxPolyphony = 16;
+      return synth;
+    }
+    const set = SAMPLE_SETS[id];
+    const sampler = new Tone.Sampler({ urls: set.urls, baseUrl: set.baseUrl });
+    await Tone.loaded();
+    return sampler;
+  }
+
+  /* --------------------- the pattern player (audio clock) --------------------- */
+
+  private tick(time: number): void {
+    const audible = this.volume >= 0.06;
+    if (!audible) {
+      if (this.wasAudible) this.releaseAll();
+      this.wasAudible = false;
+      return;
+    }
+
+    const justOpened = !this.wasAudible;
+    this.wasAudible = true;
+    this.step++;
+
+    const stepsPerNote = STEPS_PER_RATE[this.rateIndex];
+    const due = this.step % stepsPerNote === 0;
+    // fire immediately when the hand opens or the chord changes in slow modes,
+    // instead of waiting out a long subdivision
+    const force = (justOpened || this.chordDirty) && this.rateIndex <= 1;
+    if (!due && !force) {
+      if (this.chordDirty && this.rateIndex > 1) {
+        // arp modes just pick up the new chord on their next due note
+        this.arpIdx = 0;
       }
-    } else if (lane === "chord") {
-      const notes = voiceChord(chordDef, Math.max(this.voicing, 1) as VoicingLevel);
-      this.stab.triggerAttackRelease(
+      return;
+    }
+    if (force) this.step = 0;
+    this.chordDirty = false;
+
+    const chordDef = this.progression.chords[this.chordIndex];
+    const notes = voiceChord(chordDef, this.voicing);
+    const inst = this.current;
+    if (!inst) return;
+
+    const sixteenth = Tone.Time("16n").toSeconds();
+    const vel = 0.25 + this.velocity * 0.75;
+
+    if (this.rateIndex === 0) {
+      // HOLD: lush sustained chord, re-struck each bar
+      this.releaseAll(time);
+      inst.triggerAttackRelease(
         notes.map(midiToFreq),
-        "8n",
+        Tone.Time("1m").toSeconds(),
         time,
-        velocity,
+        vel,
       );
-    } else {
-      // arp: a quick 16th-note run up the current chord + octave
-      const base = [...chordDef.notes.triad, chordDef.notes.triad[0] + 12];
-      const sixteenth = Tone.Time("16n").toSeconds();
-      base.forEach((midi, i) => {
-        this.arpSynth.triggerAttackRelease(
+    } else if (this.rateIndex === 1) {
+      // 1/2: gentle strum
+      notes.forEach((midi, i) => {
+        inst.triggerAttackRelease(
           midiToFreq(midi),
-          "16n",
-          time + i * sixteenth,
-          velocity * (1 - i * 0.12),
+          Tone.Time("2n").toSeconds(),
+          time + i * 0.028,
+          vel * (1 - i * 0.06),
         );
       });
+    } else {
+      // arpeggio: cycle chord tones + octave sparkle on top
+      const pool = [...notes, notes[notes.length - 1] + 12];
+      const midi = pool[this.arpIdx % pool.length];
+      this.arpIdx++;
+      inst.triggerAttackRelease(
+        midiToFreq(midi),
+        sixteenth * stepsPerNote * 1.6,
+        time,
+        vel,
+      );
     }
   }
 
-  private playPadChord(time: number): void {
-    if (this.muted) return;
-    const chordDef = this.mood.progression[this.chordIndex];
-    const notes = voiceChord(chordDef, this.voicing);
-    this.pad.releaseAll(time);
-    this.pad.triggerAttack(notes.map(midiToFreq), time, 0.6);
+  private releaseAll(time?: number): void {
+    this.current?.releaseAll(time);
   }
 }
 

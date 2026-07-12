@@ -1,8 +1,9 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { Stage } from "./components/Stage";
 import { initTracker } from "./vision/tracker";
-import { engine } from "./audio/engine";
-import { MOODS, type Mood } from "./music/moods";
+import { engine, INSTRUMENTS } from "./audio/engine";
+import { PROGRESSIONS } from "./music/progressions";
+import { RATE_LABELS } from "./gestures/interpreter";
 import { useStore } from "./state/store";
 
 export default function App() {
@@ -14,23 +15,21 @@ export default function App() {
 
 function WelcomeScreen() {
   const { screen, errorMessage, setScreen } = useStore();
-  const [streamHolder] = useState<{ stream: MediaStream | null }>({ stream: null });
 
   const begin = useCallback(async () => {
     setScreen("loading");
     try {
-      // Audio must resume inside the user gesture; camera + model load in parallel
       const [stream] = await Promise.all([
         navigator.mediaDevices.getUserMedia({
           video: { width: 1280, height: 720, frameRate: { ideal: 60, min: 24 } },
           audio: false,
         }),
-        engine.start(),
+        engine.start("piano"),
         initTracker(),
       ]);
-      streamHolder.stream = stream;
-      useStore.setState({ screen: "stage" });
       (window as unknown as { __airloomStream: MediaStream }).__airloomStream = stream;
+      engine.play(useStore.getState().bpm);
+      useStore.setState({ screen: "stage", playing: true });
     } catch (err) {
       const msg =
         err instanceof DOMException && err.name === "NotAllowedError"
@@ -38,7 +37,7 @@ function WelcomeScreen() {
           : `Couldn't start: ${err instanceof Error ? err.message : String(err)}`;
       setScreen("error", msg);
     }
-  }, [setScreen, streamHolder]);
+  }, [setScreen]);
 
   return (
     <div className="welcome">
@@ -48,33 +47,36 @@ function WelcomeScreen() {
         AIR<span>LOOM</span>
       </h1>
       <p className="welcome-tag">
-        Wave your hands, weave a song. Your left hand shapes the harmony, your
-        right hand plays the beat — and it's impossible to hit a wrong note.
+        Wave your hands, weave a song. Your right hand plays and shapes the
+        sound, your left hand colors it — and it's impossible to hit a wrong
+        note.
       </p>
 
       <div className="welcome-hands">
-        <div className="hand-card mint">
-          <span className="hand-card-side">LEFT HAND</span>
-          <span className="hand-card-role">The Conductor</span>
-          <span className="hand-card-desc">raise = richer chords · fist = hush</span>
-        </div>
         <div className="hand-card coral">
           <span className="hand-card-side">RIGHT HAND</span>
           <span className="hand-card-role">The Performer</span>
-          <span className="hand-card-desc">strike down = play · always in time</span>
+          <span className="hand-card-desc">
+            open = louder · left↔right = rhythm · up = vibrato · push = next chord
+          </span>
+        </div>
+        <div className="hand-card mint">
+          <span className="hand-card-side">LEFT HAND</span>
+          <span className="hand-card-role">The Conductor</span>
+          <span className="hand-card-desc">
+            raise = richer chords · pinch + raise = set intensity
+          </span>
         </div>
       </div>
 
       {screen === "error" && <p className="welcome-error">{errorMessage}</p>}
 
-      <button
-        className="begin-btn"
-        onClick={begin}
-        disabled={screen === "loading"}
-      >
+      <button className="begin-btn" onClick={begin} disabled={screen === "loading"}>
         {screen === "loading" ? "warming up the loom…" : "▶ start weaving"}
       </button>
-      <p className="welcome-fineprint">needs your camera · nothing is recorded or uploaded</p>
+      <p className="welcome-fineprint">
+        needs your camera · nothing is recorded or uploaded
+      </p>
     </div>
   );
 }
@@ -82,97 +84,183 @@ function WelcomeScreen() {
 /* -------------------------------- Performance -------------------------------- */
 
 function PerformanceScreen() {
-  const { mood, playing, chordName, beat, muted, voicing, quality, setMood, setPlaying, setChord, setBeat } =
-    useStore();
   const stream = (window as unknown as { __airloomStream: MediaStream }).__airloomStream;
-  const beatRef = useRef<HTMLDivElement>(null);
+  return (
+    <div className="perf">
+      <Stage stream={stream} />
+      <TopBar />
+      <ChordDisplay />
+    </div>
+  );
+}
+
+function ChordDisplay() {
+  const chordName = useStore((s) => s.chordName);
+  const setChord = useStore((s) => s.setChord);
 
   useEffect(() => {
-    engine.onChord = (name) => setChord(name);
-    engine.onBeat = (b) => {
-      setBeat(b);
-      // retrigger pulse animation
-      const el = beatRef.current;
-      if (el) {
-        el.classList.remove("pulse");
-        void el.offsetWidth;
-        el.classList.add("pulse");
-      }
-    };
+    engine.onChord = (name, step) => setChord(name, step);
+    engine.onChord?.(
+      PROGRESSIONS.find((p) => p.id === useStore.getState().progressionId)!.chords[0].name,
+      0,
+    );
     return () => {
       engine.onChord = null;
-      engine.onBeat = null;
     };
-  }, [setChord, setBeat]);
+  }, [setChord]);
 
-  const togglePlay = async () => {
-    if (playing) {
-      engine.stop();
-      await engine.start(); // re-arm schedules for next play
-      setPlaying(false);
-      setChord("");
+  return (
+    <div className="perf-chord" key={chordName}>
+      {chordName && <span>{chordName}</span>}
+    </div>
+  );
+}
+
+/** Logic-style status bar: every hand control, its live value, and whether
+ *  the hand driving it is currently tracked. */
+function TopBar() {
+  const s = useStore();
+  const [loadingInst, setLoadingInst] = useState(false);
+
+  const progression = PROGRESSIONS.find((p) => p.id === s.progressionId)!;
+
+  const togglePlay = () => {
+    if (s.playing) {
+      engine.pause();
+      useStore.setState({ playing: false });
     } else {
-      engine.play();
-      setPlaying(true);
+      engine.play(s.bpm);
+      useStore.setState({ playing: true });
     }
   };
 
-  const pickMood = (m: Mood) => {
-    setMood(m);
-    engine.setMood(m);
+  const changeBpm = (delta: number) => {
+    const bpm = Math.min(Math.max(s.bpm + delta, 50), 180);
+    useStore.setState({ bpm });
+    engine.setBpm(bpm);
   };
 
-  const voicingLabel = ["bass", "chords", "lush"][voicing] ?? "chords";
+  const pickProgression = (id: string) => {
+    const p = PROGRESSIONS.find((x) => x.id === id)!;
+    useStore.setState({ progressionId: id });
+    engine.setProgression(p);
+  };
+
+  const pickInstrument = async (id: string) => {
+    useStore.setState({ instrumentId: id });
+    setLoadingInst(true);
+    try {
+      await engine.setInstrument(id);
+    } finally {
+      setLoadingInst(false);
+    }
+  };
 
   return (
-    <div className="perf" style={{ "--mood": mood.color } as React.CSSProperties}>
-      <Stage stream={stream} />
-
-      <header className="perf-top">
-        <span className="perf-logo">AIRLOOM</span>
-        <div className="perf-status">
-          {muted && <span className="status-muted">✊ hushed</span>}
-          <span className="status-voicing">{voicingLabel}</span>
-          <span
-            className={`status-dot ${quality > 0.6 ? "good" : quality > 0 ? "ok" : "bad"}`}
-            title="hand tracking quality"
-          />
-        </div>
-      </header>
-
-      <div className="perf-chord" key={chordName}>
-        {playing && chordName && <span>{chordName}</span>}
+    <header className="topbar">
+      <div className="tb-left">
+        <span className="tb-logo">AIRLOOM</span>
+        <button className={`tb-play ${s.playing ? "on" : ""}`} onClick={togglePlay}>
+          {s.playing ? "❚❚" : "▶"}
+        </button>
       </div>
 
-      <footer className="perf-bar">
-        <button className={`play-btn ${playing ? "on" : ""}`} onClick={togglePlay}>
-          {playing ? "◼" : "▶"}
-        </button>
+      <div className="tb-lcd">
+        <Cell label={progression.label} on wide>
+          <div className="chord-steps">
+            {progression.chords.map((c, i) => (
+              <span key={i} className={`chord-step ${i === s.chordStep ? "now" : ""}`}>
+                {c.name}
+              </span>
+            ))}
+          </div>
+        </Cell>
 
-        <div ref={beatRef} className="beat-ring">
-          <span>{playing ? beat + 1 : "·"}</span>
-        </div>
+        <Cell label="VOLUME" on={s.rightOn}>
+          <Meter value={s.volume} color="coral" />
+        </Cell>
+        <Cell label="RHYTHM" on={s.rightOn}>
+          <span className="cell-value">{RATE_LABELS[s.rate]}</span>
+        </Cell>
+        <Cell label="VIBRATO" on={s.rightOn}>
+          <Meter value={s.vibrato} color="coral" />
+        </Cell>
+        <Cell label="RICHNESS" on={s.leftOn}>
+          <span className="cell-value mint">
+            {["BASS", "CHORD", "LUSH"][s.voicing]}
+          </span>
+        </Cell>
+        <Cell label={s.pinching ? "VELOCITY ●" : "VELOCITY"} on={s.leftOn} hot={s.pinching}>
+          <Meter value={s.velocity} color={s.pinching ? "amber" : "mint"} />
+        </Cell>
 
-        <div className="moods">
-          {MOODS.map((m) => (
-            <button
-              key={m.id}
-              className={`mood-chip ${mood.id === m.id ? "active" : ""}`}
-              style={{ "--chip": m.color } as React.CSSProperties}
-              onClick={() => pickMood(m)}
-            >
-              <span className="mood-emoji">{m.emoji}</span>
-              <span className="mood-label">{m.label}</span>
-              <span className="mood-tagline">{m.tagline}</span>
-            </button>
+        <Cell label="TEMPO" on>
+          <div className="bpm-ctl">
+            <button onClick={() => changeBpm(-4)}>−</button>
+            <span className="cell-value">{s.bpm}</span>
+            <button onClick={() => changeBpm(4)}>+</button>
+          </div>
+        </Cell>
+      </div>
+
+      <div className="tb-right">
+        <select
+          className="tb-select"
+          value={s.progressionId}
+          onChange={(e) => pickProgression(e.target.value)}
+          title={progression.vibe}
+        >
+          {PROGRESSIONS.map((p) => (
+            <option key={p.id} value={p.id}>
+              {p.label}
+            </option>
           ))}
-        </div>
+        </select>
+        <select
+          className="tb-select"
+          value={s.instrumentId}
+          onChange={(e) => pickInstrument(e.target.value)}
+        >
+          {INSTRUMENTS.map((i) => (
+            <option key={i.id} value={i.id}>
+              {loadingInst && i.id === s.instrumentId ? "loading…" : i.label}
+            </option>
+          ))}
+        </select>
+        <span
+          className={`status-dot ${s.quality > 0.6 ? "good" : s.quality > 0 ? "ok" : "bad"}`}
+          title="hand tracking quality"
+        />
+      </div>
+    </header>
+  );
+}
 
-        <div className="bpm">
-          <span className="bpm-num">{mood.bpm}</span>
-          <span className="bpm-label">BPM</span>
-        </div>
-      </footer>
+function Cell({
+  label,
+  on,
+  hot,
+  wide,
+  children,
+}: {
+  label: string;
+  on: boolean;
+  hot?: boolean;
+  wide?: boolean;
+  children: React.ReactNode;
+}) {
+  return (
+    <div className={`lcd-cell ${on ? "on" : "off"} ${hot ? "hot" : ""} ${wide ? "wide" : ""}`}>
+      <span className="cell-label">{label}</span>
+      {children}
+    </div>
+  );
+}
+
+function Meter({ value, color }: { value: number; color: string }) {
+  return (
+    <div className="meter">
+      <div className={`meter-fill ${color}`} style={{ width: `${Math.round(value * 100)}%` }} />
     </div>
   );
 }

@@ -10,9 +10,10 @@ Airloom is a camera-powered instrument for people who've never opened a DAW, nev
 
 | | |
 |---|---|
-| 🫲 **Left hand — The Conductor** | Raise it for richer, lusher chords. Lower it for deep bass. Close your fist to hush everything. |
-| 🫱 **Right hand — The Performer** | Strike downward to play. Three lanes: **Sparkle** (arpeggios), **Chords** (stabs), **Drums**. Hit harder = louder. |
-| 🎨 **Moods, not scales** | Pick *Chill*, *Moody*, *Hype*, or *Dreamy*. Airloom locks everything to a scale and chord progression that always works — **you cannot play a wrong note.** |
+| 🫱 **Right hand — The Performer** | **Open your hand** to raise the volume (fist = silence). Move **side to side** to set the rhythm — from long held chords to sparkling 16th-note runs. Move **up** for vibrato. **Push toward the camera** to advance to the next chord, like pressing an invisible button. |
+| 🫲 **Left hand — The Conductor** | **Raise it** for richer, lusher chords; lower it for deep bass. **Pinch** (thumb + index) and raise/lower to dial in note intensity — the value latches when you let go. |
+| 🎼 **Progressions, not theory** | Pick *Anthem*, *Heartache*, *Velvet*, *Daydream*, or *Shadow*. Airloom locks everything to voicings that always work — **you cannot play a wrong note.** |
+| 🎹 **Real instruments** | Sampled grand piano, acoustic guitar, and violin (plus a dreamy synth), switchable live from the top bar. |
 
 ## Why it doesn't feel laggy (the interesting part)
 
@@ -54,6 +55,7 @@ Webcam ─► MediaPipe HandLandmarker (GPU, VIDEO mode)
 ## Roadmap
 
 - [ ] **Loop recording & layering** — perform 4 bars, loop it, weave the next layer on top
+- [ ] **Drums / percussion layer** — bring back strike-to-drum as an optional second mode
 - [ ] **Latency calibration** — air-tap test measures your camera+audio offset per device
 - [ ] **WebMIDI out** — use Airloom as a controller for Ableton / FL / Logic
 - [ ] **Tauri desktop app** — native virtual MIDI port, installable
