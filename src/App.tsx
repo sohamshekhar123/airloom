@@ -16,6 +16,28 @@ export default function App() {
   return screen === "stage" ? <PerformanceScreen /> : <WelcomeScreen />;
 }
 
+/** `?demo` runs the stage with a synthetic video stream — for UI work on
+ *  machines with no camera. Hand tracking simply sees nothing. */
+async function getCameraStream(): Promise<MediaStream> {
+  if (new URLSearchParams(location.search).has("demo")) {
+    const c = document.createElement("canvas");
+    c.width = 1280;
+    c.height = 720;
+    const g = c.getContext("2d")!;
+    const paint = () => {
+      g.fillStyle = "#191511";
+      g.fillRect(0, 0, c.width, c.height);
+    };
+    paint();
+    setInterval(paint, 200);
+    return c.captureStream(24);
+  }
+  return navigator.mediaDevices.getUserMedia({
+    video: { width: 1280, height: 720, frameRate: { ideal: 60, min: 24 } },
+    audio: false,
+  });
+}
+
 /* ---------------------------------- Welcome ---------------------------------- */
 
 function WelcomeScreen() {
@@ -25,10 +47,7 @@ function WelcomeScreen() {
     setScreen("loading");
     try {
       const [stream] = await Promise.all([
-        navigator.mediaDevices.getUserMedia({
-          video: { width: 1280, height: 720, frameRate: { ideal: 60, min: 24 } },
-          audio: false,
-        }),
+        getCameraStream(),
         engine.start("piano"),
         initTracker(),
       ]);
@@ -219,19 +238,29 @@ function TopBar() {
         </Cell>
 
         <Cell label="VOLUME" on={s.rightOn}>
-          <Meter value={s.volume} color="coral" />
+          <Knob value={s.volume} color="coral" />
         </Cell>
         <Cell label="RHYTHM" on={s.rightOn}>
-          <span className="cell-value">{RATE_LABELS[s.rate]}</span>
+          <div className="rate-led">
+            {RATE_LABELS.map((r, i) => (
+              <i key={r} className={i === s.rate ? "lit" : ""} title={r} />
+            ))}
+            <span className="cell-value">{RATE_LABELS[s.rate]}</span>
+          </div>
         </Cell>
         <Cell label="VIBRATO" on={s.rightOn}>
-          <Meter value={s.vibrato} color="coral" />
+          <Knob value={s.vibrato} color="coral" />
         </Cell>
         <Cell label="RICHNESS" on={s.leftOn}>
-          <span className="cell-value mint">{["BASS", "CHORD", "LUSH"][s.voicing]}</span>
+          <div className="rich-led">
+            {["BASS", "CHORD", "LUSH"].map((r, i) => (
+              <i key={r} className={i <= s.voicing ? "lit" : ""} title={r} />
+            ))}
+            <span className="cell-value mint">{["BASS", "CHORD", "LUSH"][s.voicing]}</span>
+          </div>
         </Cell>
         <Cell label={s.pinching ? "VELOCITY ●" : "VELOCITY"} on={s.leftOn} hot={s.pinching}>
-          <Meter value={s.velocity} color={s.pinching ? "amber" : "mint"} />
+          <Knob value={s.velocity} color={s.pinching ? "amber" : "mint"} />
         </Cell>
         <Cell label="TEMPO" on>
           <div className="bpm-ctl">
@@ -474,10 +503,32 @@ function Cell({
   );
 }
 
-function Meter({ value, color }: { value: number; color: string }) {
+/** A hardware rotary knob: recessed value arc + machined face with dot. */
+function Knob({ value, color }: { value: number; color: string }) {
+  const SWEEP = 270; // degrees of travel
+  const angle = -SWEEP / 2 + value * SWEEP;
+  const r = 17;
+  const circ = 2 * Math.PI * r;
+  const trackLen = (circ * SWEEP) / 360;
   return (
-    <div className="meter">
-      <div className={`meter-fill ${color}`} style={{ width: `${Math.round(value * 100)}%` }} />
+    <div className={`knob ${color}`}>
+      <svg viewBox="0 0 44 44">
+        <circle
+          className="knob-track"
+          cx="22" cy="22" r={r}
+          strokeDasharray={`${trackLen} ${circ}`}
+          transform="rotate(135 22 22)"
+        />
+        <circle
+          className="knob-arc"
+          cx="22" cy="22" r={r}
+          strokeDasharray={`${trackLen * value} ${circ}`}
+          transform="rotate(135 22 22)"
+        />
+      </svg>
+      <div className="knob-face" style={{ transform: `rotate(${angle}deg)` }}>
+        <span className="knob-dot" />
+      </div>
     </div>
   );
 }
