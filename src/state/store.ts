@@ -6,8 +6,10 @@
  */
 import { create } from "zustand";
 import { PROGRESSIONS, type Chord } from "../music/progressions";
+import type { TrackMeta } from "../audio/engine";
 
 export type Screen = "welcome" | "loading" | "stage" | "error";
+export type StudioTab = "tracks" | "synth" | "fx" | "sampler";
 
 interface PerfSnapshot {
   rightOn: boolean;
@@ -35,6 +37,11 @@ interface AirloomState extends PerfSnapshot {
   loomOpen: boolean;
   selectedSlot: number;
   recording: boolean;
+  recordFormat: "wav" | "webm";
+  studioOpen: boolean;
+  studioTab: StudioTab;
+  tracks: TrackMeta[];
+  selectedTrackId: number;
 
   setScreen: (s: Screen, error?: string) => void;
   setPerf: (p: PerfSnapshot) => void;
@@ -56,6 +63,11 @@ export const useStore = create<AirloomState>((set) => ({
   loomOpen: false,
   selectedSlot: 0,
   recording: false,
+  recordFormat: "wav",
+  studioOpen: false,
+  studioTab: "tracks",
+  tracks: [],
+  selectedTrackId: 1,
 
   rightOn: false,
   leftOn: false,

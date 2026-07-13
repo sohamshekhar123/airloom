@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Stage } from "./components/Stage";
+import { Studio } from "./components/Studio";
 import { initTracker } from "./vision/tracker";
-import { engine, INSTRUMENTS } from "./audio/engine";
+import { engine } from "./audio/engine";
 import {
   CHORD_PALETTE,
   PROGRESSIONS,
@@ -48,7 +49,7 @@ function WelcomeScreen() {
     try {
       const [stream] = await Promise.all([
         getCameraStream(),
-        engine.start("piano"),
+        engine.start(),
         initTracker(),
       ]);
       (window as unknown as { __airloomStream: MediaStream }).__airloomStream = stream;
@@ -143,12 +144,31 @@ function WelcomeScreen() {
 function PerformanceScreen() {
   const stream = (window as unknown as { __airloomStream: MediaStream }).__airloomStream;
   const loomOpen = useStore((s) => s.loomOpen);
+  const studioOpen = useStore((s) => s.studioOpen);
+
+  useEffect(() => {
+    engine.onTracks = (tracks) => {
+      const st = useStore.getState();
+      useStore.setState({
+        tracks,
+        selectedTrackId: tracks.some((t) => t.id === st.selectedTrackId)
+          ? st.selectedTrackId
+          : (tracks.find((t) => t.armed)?.id ?? tracks[0]?.id ?? 1),
+      });
+    };
+    useStore.setState({ tracks: engine.trackMetas });
+    return () => {
+      engine.onTracks = null;
+    };
+  }, []);
+
   return (
     <div className="perf">
       <Stage stream={stream} />
       <TopBar />
       <ChordDisplay />
       {loomOpen && <Loom />}
+      {studioOpen && !loomOpen && <Studio />}
     </div>
   );
 }
@@ -177,7 +197,6 @@ function ChordDisplay() {
 
 function TopBar() {
   const s = useStore();
-  const [loadingInst, setLoadingInst] = useState(false);
 
   const togglePlay = () => {
     if (s.playing) {
@@ -185,6 +204,7 @@ function TopBar() {
       useStore.setState({ playing: false });
     } else {
       engine.play(s.bpm);
+      engine.restartClips();
       useStore.setState({ playing: true });
     }
   };
@@ -206,13 +226,23 @@ function TopBar() {
     engine.setChords(p.chords, true);
   };
 
-  const pickInstrument = async (id: string) => {
-    useStore.setState({ instrumentId: id });
-    setLoadingInst(true);
+  const saveProject = () => {
+    const json = engine.serialize(s.chords, s.progressionLabel, s.bpm);
+    const blob = new Blob([json], { type: "application/json" });
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = `${s.progressionLabel.replace(/\s+/g, "-").toLowerCase()}.airloom`;
+    a.click();
+    URL.revokeObjectURL(a.href);
+  };
+
+  const openProject = async (f: File) => {
     try {
-      await engine.setInstrument(id);
-    } finally {
-      setLoadingInst(false);
+      const { chords, label, bpm } = await engine.load(await f.text());
+      useStore.setState({ chords, progressionLabel: label, bpm });
+      engine.setBpm(bpm);
+    } catch (err) {
+      alert(`Couldn't open project: ${err instanceof Error ? err.message : err}`);
     }
   };
 
@@ -234,6 +264,17 @@ function TopBar() {
                 {c.name}
               </span>
             ))}
+            <button
+              className={`loom-inline ${s.loomOpen ? "on" : ""}`}
+              title="edit chords in the Loom"
+              onClick={() => {
+                const open = !s.loomOpen;
+                useStore.setState({ loomOpen: open, studioOpen: open ? false : s.studioOpen });
+                engine.setEditorMode(open || s.studioOpen);
+              }}
+            >
+              ✎ LOOM
+            </button>
           </div>
         </Cell>
 
@@ -273,14 +314,14 @@ function TopBar() {
 
       <div className="tb-right">
         <button
-          className={`tb-loom-btn ${s.loomOpen ? "on" : ""}`}
+          className={`tb-loom-btn ${s.studioOpen ? "on" : ""}`}
           onClick={() => {
-            const open = !s.loomOpen;
-            useStore.setState({ loomOpen: open });
+            const open = !s.studioOpen;
+            useStore.setState({ studioOpen: open, loomOpen: false });
             engine.setEditorMode(open);
           }}
         >
-          THE LOOM
+          STUDIO
         </button>
         <select
           className="tb-select"
@@ -296,17 +337,18 @@ function TopBar() {
             <option value={s.progressionLabel}>{s.progressionLabel}</option>
           )}
         </select>
-        <select
-          className="tb-select"
-          value={s.instrumentId}
-          onChange={(e) => pickInstrument(e.target.value)}
-        >
-          {INSTRUMENTS.map((i) => (
-            <option key={i.id} value={i.id}>
-              {loadingInst && i.id === s.instrumentId ? "loading…" : i.label}
-            </option>
-          ))}
-        </select>
+        <button className="tb-icon" title="save project file" onClick={saveProject}>
+          ⬇ SAVE
+        </button>
+        <label className="tb-icon" title="open project file">
+          ⬆ OPEN
+          <input
+            type="file"
+            accept=".airloom,application/json"
+            hidden
+            onChange={(e) => e.target.files?.[0] && openProject(e.target.files[0])}
+          />
+        </label>
         <span
           className={`status-dot ${s.quality > 0.6 ? "good" : s.quality > 0 ? "ok" : "bad"}`}
           title="hand tracking quality"
@@ -318,11 +360,13 @@ function TopBar() {
 
 function RecordButton() {
   const recording = useStore((s) => s.recording);
+  const format = useStore((s) => s.recordFormat);
   const [elapsed, setElapsed] = useState(0);
   const timerRef = useRef<number>(0);
 
   const toggle = async () => {
     if (!recording) {
+      engine.recordFormat = format;
       engine.startRecording();
       useStore.setState({ recording: true });
       setElapsed(0);
@@ -330,12 +374,12 @@ function RecordButton() {
     } else {
       window.clearInterval(timerRef.current);
       useStore.setState({ recording: false });
-      const blob = await engine.stopRecording();
+      const { blob, ext } = await engine.stopRecording();
       const url = URL.createObjectURL(blob);
       const a = document.createElement("a");
       const stamp = new Date().toISOString().slice(0, 19).replace(/[T:]/g, "-");
       a.href = url;
-      a.download = `airloom-take-${stamp}.webm`;
+      a.download = `airloom-take-${stamp}.${ext}`;
       a.click();
       URL.revokeObjectURL(url);
     }
@@ -345,11 +389,23 @@ function RecordButton() {
   const ss = String(elapsed % 60).padStart(2, "0");
 
   return (
-    <button className={`tb-rec ${recording ? "on" : ""}`} onClick={toggle}
-      title={recording ? "stop & save recording" : "record audio"}>
-      <span className="rec-dot" />
-      {recording ? `${mm}:${ss}` : "REC"}
-    </button>
+    <div className="rec-group">
+      <button className={`tb-rec ${recording ? "on" : ""}`} onClick={toggle}
+        title={recording ? "stop & save recording" : "record audio"}>
+        <span className="rec-dot" />
+        {recording ? `${mm}:${ss}` : "REC"}
+      </button>
+      <button
+        className="rec-fmt"
+        disabled={recording}
+        title="recording format — WAV is lossless"
+        onClick={() =>
+          useStore.setState({ recordFormat: format === "wav" ? "webm" : "wav" })
+        }
+      >
+        {format.toUpperCase()}
+      </button>
+    </div>
   );
 }
 

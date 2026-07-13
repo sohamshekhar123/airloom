@@ -1,15 +1,16 @@
 /**
- * Airloom's sound engine, built on Tone.js.
+ * Airloom's sound engine — now a small DAW.
  *
- * The instrument is a continuous PATTERN PLAYER conducted by the hands:
- * a 16th-note tick on the audio clock decides, each slot, whether to sound
- * notes of the current chord — at the rate, volume, velocity, richness and
- * vibrato the hands are currently expressing. The master clock is the
- * AUDIO clock (Tone.Transport), never a JS timer, so everything stays in time
- * regardless of camera latency.
+ * TRACKS: each track owns an instrument (sampled / AirSynth / user sampler),
+ * a vibrato stage, an FX rack, volume and pan. The hands play the ARMED
+ * track; other tracks play back their recorded loop clips.
  *
- * Instruments are real sampled instruments (Tone.Sampler over CDN-hosted
- * sample sets), with a synth fallback that needs no network.
+ * CLOCK: everything runs on the audio clock (Tone.Transport). Hand strikes
+ * and pattern hits land on the 16th-note grid; loop clips are Tone.Parts
+ * quantized to bar boundaries.
+ *
+ * The pattern player hits the FULL CHORD as one at every rate (HOLD
+ * sustains, 1/2 strums, 1/4–1/16 are rhythmic chord pulses).
  */
 import * as Tone from "tone";
 import {
@@ -19,17 +20,19 @@ import {
   type Chord,
   type VoicingLevel,
 } from "../music/progressions";
+import { AirSynth, type SynthPatch } from "./synth";
+import { SYNTH_PRESETS } from "../music/presets";
+import { FxChain, DEFAULT_FX, type FxParams } from "./fx";
+import { WavRecorder } from "./wav";
 
-export interface InstrumentDef {
-  id: string;
-  label: string;
-}
+/* ------------------------------- instruments ------------------------------- */
 
-export const INSTRUMENTS: InstrumentDef[] = [
+export type TrackKind = "sampled" | "synth" | "sampler";
+
+export const SAMPLED_INSTRUMENTS = [
   { id: "piano", label: "Grand Piano" },
   { id: "guitar", label: "Acoustic Guitar" },
   { id: "harp", label: "Harp" },
-  { id: "dream", label: "Dream Synth" },
 ];
 
 const SAMPLE_SETS: Record<string, { baseUrl: string; urls: Record<string, string> }> = {
@@ -59,10 +62,111 @@ const SAMPLE_SETS: Record<string, { baseUrl: string; urls: Record<string, string
   },
 };
 
-/** 16th-note steps between notes for each rate setting. */
-const STEPS_PER_RATE = [16, 8, 4, 2, 1]; // HOLD, 1/2, 1/4, 1/8, 1/16
+interface Playable {
+  triggerAttackRelease(
+    notes: number[] | string[] | number | string,
+    dur: number,
+    time?: number,
+    vel?: number,
+  ): void;
+  releaseAll(time?: number): void;
+  connect(dest: Tone.InputNode): unknown;
+  disconnect(): unknown;
+  dispose(): void;
+}
 
-type Playable = Tone.Sampler | Tone.PolySynth;
+/** Wraps Tone.Sampler / PolySynth so midi numbers are accepted uniformly. */
+class SamplerWrap implements Playable {
+  constructor(private inner: Tone.Sampler) {}
+  triggerAttackRelease(notes: number[] | number | string[] | string, dur: number, time?: number, vel?: number) {
+    const arr = (Array.isArray(notes) ? notes : [notes]).map((n) =>
+      typeof n === "number" ? midiToFreq(n) : n,
+    );
+    this.inner.triggerAttackRelease(arr, dur, time, vel);
+  }
+  releaseAll(time?: number) { this.inner.releaseAll(time); }
+  connect(d: Tone.InputNode) { return this.inner.connect(d); }
+  disconnect() { return this.inner.disconnect(); }
+  dispose() { this.inner.dispose(); }
+}
+
+/* --------------------------------- tracks --------------------------------- */
+
+export interface NoteEvent {
+  time: number; // seconds from loop start
+  notes: number[];
+  dur: number;
+  vel: number;
+}
+
+export interface TrackMeta {
+  id: number;
+  name: string;
+  kind: TrackKind;
+  sourceId: string; // sampled id, patch name, or sample filename
+  armed: boolean;
+  muted: boolean;
+  soloed: boolean;
+  gain: number; // 0..1
+  pan: number; // -1..1
+  hasClip: boolean;
+  recording: boolean;
+  recPending: boolean;
+  loading: boolean;
+}
+
+class Track {
+  playable: Playable | null = null;
+  patch: SynthPatch | null = null;
+  sampleBuffer: AudioBuffer | null = null;
+  sampleRoot = 60;
+  vibrato = new Tone.Vibrato(5, 0);
+  fx: FxChain;
+  vol = new Tone.Volume(0);
+  pan = new Tone.Panner(0);
+  gate = new Tone.Gain(1);
+  clip: NoteEvent[] | null = null;
+  part: Tone.Part<NoteEvent> | null = null;
+  loopBars = 4;
+  meta: TrackMeta;
+
+  constructor(meta: TrackMeta, master: Tone.ToneAudioNode, fxParams?: FxParams) {
+    this.meta = meta;
+    this.fx = new FxChain(fxParams);
+    this.vibrato.connect(this.gate);
+    this.gate.connect(this.fx.input);
+    this.fx.output.connect(this.vol);
+    this.vol.connect(this.pan);
+    this.pan.connect(master);
+  }
+
+  attach(p: Playable): void {
+    this.playable?.disconnect();
+    this.playable?.dispose();
+    this.playable = p;
+    p.connect(this.vibrato);
+  }
+
+  applyMix(anySolo: boolean): void {
+    const audible = !this.meta.muted && (!anySolo || this.meta.soloed);
+    this.vol.volume.rampTo(audible ? Tone.gainToDb(Math.max(this.meta.gain, 0.001)) : -Infinity, 0.05);
+    this.pan.pan.rampTo(this.meta.pan, 0.05);
+  }
+
+  dispose(): void {
+    this.part?.dispose();
+    this.playable?.dispose();
+    this.vibrato.dispose();
+    this.gate.dispose();
+    this.fx.dispose();
+    this.vol.dispose();
+    this.pan.dispose();
+  }
+}
+
+/* --------------------------------- engine --------------------------------- */
+
+const STEPS_PER_RATE = [16, 8, 4, 2, 1]; // HOLD, 1/2, 1/4, 1/8, 1/16
 
 class AirloomEngine {
   private started = false;
@@ -70,40 +174,44 @@ class AirloomEngine {
   private chordIndex = 0;
   private editorMode = false;
 
-  // hand-driven expression (written every frame, read on audio ticks)
-  private volume = 0; // 0..1 from right-hand openness
+  private volume = 0;
   private rateIndex = 2;
   private voicing: VoicingLevel = 1;
   private velocity = 0.8;
 
   private step = 0;
-  private arpIdx = 0;
   private wasAudible = false;
   private chordDirty = false;
 
-  private instruments = new Map<string, Playable>();
-  private current: Playable | null = null;
-  private currentId = "";
+  private tracks: Track[] = [];
+  private nextTrackId = 1;
+  private master!: Tone.Gain;
 
-  private vibrato!: Tone.Vibrato;
-  private gate!: Tone.Gain;
   private recorder!: Tone.Recorder;
+  private wavRecorder = new WavRecorder();
+  recordFormat: "wav" | "webm" = "wav";
+
+  // loop recording state
+  private recTrack: Track | null = null;
+  private recStart = 0; // transport seconds at loop start
+  private recEvents: NoteEvent[] = [];
+  loopBars = 4;
 
   onChord: ((name: string, index: number) => void) | null = null;
   onBeat: ((beat: number) => void) | null = null;
+  onTracks: ((tracks: TrackMeta[]) => void) | null = null;
 
-  /** Must be called from a user gesture (browser autoplay policy). */
-  async start(defaultInstrument = "piano"): Promise<void> {
+  /* ------------------------------ lifecycle ------------------------------ */
+
+  async start(): Promise<void> {
     if (this.started) return;
     await Tone.start();
 
-    const reverb = new Tone.Reverb({ decay: 3.2, wet: 0.28 }).toDestination();
+    this.master = new Tone.Gain(0.9);
+    const limiter = new Tone.Limiter(-1.5).toDestination();
+    this.master.connect(limiter);
     this.recorder = new Tone.Recorder();
-    reverb.connect(this.recorder);
-    const limiter = new Tone.Limiter(-2).connect(reverb);
-    const trim = new Tone.Volume(-4).connect(limiter);
-    this.gate = new Tone.Gain(0).connect(trim);
-    this.vibrato = new Tone.Vibrato(5, 0).connect(this.gate);
+    this.master.connect(this.recorder);
 
     const transport = Tone.getTransport();
     transport.scheduleRepeat((time) => this.tick(time), "16n");
@@ -112,8 +220,12 @@ class AirloomEngine {
       Tone.getDraw().schedule(() => this.onBeat?.(beat), time);
     }, "4n");
 
-    await this.setInstrument(defaultInstrument);
     this.started = true;
+    if (this.tracks.length === 0) {
+      await this.addTrack("sampled", "piano", "Keys");
+      this.tracks[0].meta.armed = true;
+      this.emitTracks();
+    }
   }
 
   play(bpm: number): void {
@@ -124,7 +236,7 @@ class AirloomEngine {
 
   pause(): void {
     Tone.getTransport().pause();
-    this.releaseAll();
+    this.tracks.forEach((t) => t.playable?.releaseAll());
   }
 
   get isRunning(): boolean {
@@ -135,7 +247,196 @@ class AirloomEngine {
     Tone.getTransport().bpm.rampTo(bpm, 0.4);
   }
 
-  /** Replace the working progression (from presets or the Loom editor). */
+  /* -------------------------------- tracks -------------------------------- */
+
+  get trackMetas(): TrackMeta[] {
+    return this.tracks.map((t) => ({ ...t.meta }));
+  }
+
+  private emitTracks(): void {
+    this.onTracks?.(this.trackMetas);
+  }
+
+  private get armed(): Track | null {
+    return this.tracks.find((t) => t.meta.armed) ?? null;
+  }
+
+  track(id: number): Track | undefined {
+    return this.tracks.find((t) => t.meta.id === id);
+  }
+
+  async addTrack(kind: TrackKind, sourceId: string, name?: string): Promise<number> {
+    const id = this.nextTrackId++;
+    const meta: TrackMeta = {
+      id,
+      name: name ?? `Track ${id}`,
+      kind,
+      sourceId,
+      armed: false,
+      muted: false,
+      soloed: false,
+      gain: 0.85,
+      pan: 0,
+      hasClip: false,
+      recording: false,
+      recPending: false,
+      loading: true,
+    };
+    const t = new Track(meta, this.master);
+    this.tracks.push(t);
+    this.emitTracks();
+    await this.setTrackSource(id, kind, sourceId);
+    return id;
+  }
+
+  removeTrack(id: number): void {
+    const i = this.tracks.findIndex((t) => t.meta.id === id);
+    if (i === -1 || this.tracks.length <= 1) return;
+    const [t] = this.tracks.splice(i, 1);
+    t.dispose();
+    if (t.meta.armed && this.tracks[0]) this.tracks[0].meta.armed = true;
+    this.applyMix();
+    this.emitTracks();
+  }
+
+  async setTrackSource(id: number, kind: TrackKind, sourceId: string, buffer?: AudioBuffer, root?: number): Promise<void> {
+    const t = this.track(id);
+    if (!t) return;
+    t.meta.loading = true;
+    t.meta.kind = kind;
+    t.meta.sourceId = sourceId;
+    this.emitTracks();
+    try {
+      if (kind === "sampled") {
+        const set = SAMPLE_SETS[sourceId];
+        const sampler = new Tone.Sampler({ urls: set.urls, baseUrl: set.baseUrl });
+        await Tone.loaded();
+        t.attach(new SamplerWrap(sampler));
+        t.patch = null;
+      } else if (kind === "synth") {
+        const patch = SYNTH_PRESETS.find((p) => p.name === sourceId) ?? SYNTH_PRESETS[0];
+        if (t.playable instanceof AirSynth) {
+          t.playable.apply(patch);
+        } else {
+          t.attach(new AirSynth(patch));
+        }
+        t.patch = { ...patch };
+      } else if (kind === "sampler" && (buffer || t.sampleBuffer)) {
+        if (buffer) t.sampleBuffer = buffer;
+        if (root) t.sampleRoot = root;
+        const note = Tone.Frequency(t.sampleRoot, "midi").toNote();
+        const sampler = new Tone.Sampler({ urls: { [note]: new Tone.ToneAudioBuffer(t.sampleBuffer!) } });
+        t.attach(new SamplerWrap(sampler));
+        t.patch = null;
+      }
+    } finally {
+      t.meta.loading = false;
+      this.emitTracks();
+    }
+  }
+
+  /** Live-edit the armed/selected synth track's patch. */
+  applyPatch(id: number, patch: SynthPatch): void {
+    const t = this.track(id);
+    if (t?.playable instanceof AirSynth) {
+      t.playable.apply(patch);
+      t.patch = { ...patch };
+      t.meta.sourceId = patch.name;
+      this.emitTracks();
+    }
+  }
+
+  getPatch(id: number): SynthPatch | null {
+    return this.track(id)?.patch ?? null;
+  }
+
+  setFx(id: number, params: FxParams): void {
+    this.track(id)?.fx.set(params);
+  }
+
+  getFx(id: number): FxParams | null {
+    const t = this.track(id);
+    return t ? structuredClone(t.fx.params) : null;
+  }
+
+  updateTrackMeta(id: number, patch: Partial<TrackMeta>): void {
+    const t = this.track(id);
+    if (!t) return;
+    if (patch.armed) this.tracks.forEach((x) => (x.meta.armed = x === t));
+    Object.assign(t.meta, patch);
+    this.applyMix();
+    this.emitTracks();
+  }
+
+  private applyMix(): void {
+    const anySolo = this.tracks.some((t) => t.meta.soloed);
+    this.tracks.forEach((t) => t.applyMix(anySolo));
+  }
+
+  /* ---------------------------- loop recording ---------------------------- */
+
+  /** Arm loop-record: starts at the next bar, runs loopBars, then loops. */
+  requestLoopRecord(id: number): void {
+    const t = this.track(id);
+    if (!t || !this.isRunning) return;
+    this.updateTrackMeta(id, { armed: true, recPending: true });
+    const transport = Tone.getTransport();
+    transport.scheduleOnce((time) => {
+      this.recTrack = t;
+      this.recStart = transport.seconds;
+      this.recEvents = [];
+      t.meta.recPending = false;
+      t.meta.recording = true;
+      Tone.getDraw().schedule(() => this.emitTracks(), time);
+      const loopSecs = Tone.Time("1m").toSeconds() * this.loopBars;
+      transport.scheduleOnce(() => this.finishLoopRecord(), transport.seconds + loopSecs);
+    }, transport.nextSubdivision("1m"));
+  }
+
+  cancelLoopRecord(): void {
+    if (this.recTrack) {
+      this.recTrack.meta.recording = false;
+      this.recTrack.meta.recPending = false;
+      this.recTrack = null;
+      this.emitTracks();
+    }
+  }
+
+  private finishLoopRecord(): void {
+    const t = this.recTrack;
+    if (!t) return;
+    this.recTrack = null;
+    t.meta.recording = false;
+    t.clip = this.recEvents;
+    t.meta.hasClip = this.recEvents.length > 0;
+    if (t.meta.hasClip) this.startClip(t);
+    this.emitTracks();
+  }
+
+  private startClip(t: Track): void {
+    t.part?.dispose();
+    if (!t.clip?.length) return;
+    const loopSecs = Tone.Time("1m").toSeconds() * this.loopBars;
+    t.part = new Tone.Part<NoteEvent>((time, ev) => {
+      t.playable?.triggerAttackRelease(ev.notes, ev.dur, time, ev.vel);
+    }, t.clip);
+    t.part.loop = true;
+    t.part.loopEnd = loopSecs;
+    t.part.start(Tone.getTransport().nextSubdivision("1m"));
+  }
+
+  clearClip(id: number): void {
+    const t = this.track(id);
+    if (!t) return;
+    t.part?.dispose();
+    t.part = null;
+    t.clip = null;
+    t.meta.hasClip = false;
+    this.emitTracks();
+  }
+
+  /* ----------------------------- performance ----------------------------- */
+
   setChords(chords: Chord[], resetIndex = false): void {
     this.chords = chords;
     if (resetIndex || this.chordIndex >= chords.length) this.chordIndex = 0;
@@ -143,56 +444,36 @@ class AirloomEngine {
     this.onChord?.(chords[this.chordIndex].name, this.chordIndex);
   }
 
-  /** The invisible button: right hand pinches. */
   advanceChord(): void {
     this.chordIndex = (this.chordIndex + 1) % this.chords.length;
     this.chordDirty = true;
-    this.arpIdx = 0;
     this.onChord?.(this.chords[this.chordIndex].name, this.chordIndex);
   }
 
-  /** While the Loom editor is open, keep the pattern audible even if the
-   *  hands are down, so edits are heard immediately. */
   setEditorMode(on: boolean): void {
     this.editorMode = on;
-    if (on && this.started) this.gate.gain.rampTo(0.6, 0.2);
   }
 
-  /** Audition a single piano-key click through the current instrument. */
   previewNote(midi: number): void {
-    this.current?.triggerAttackRelease(midiToFreq(midi), 0.5, Tone.now(), 0.8);
+    this.armed?.playable?.triggerAttackRelease([midi], 0.5, Tone.now(), 0.8);
   }
 
-  /* ------------------------------- recording ------------------------------- */
-
-  startRecording(): void {
-    if (this.recorder.state !== "started") this.recorder.start();
-  }
-
-  async stopRecording(): Promise<Blob> {
-    return this.recorder.stop();
-  }
-
-  get isRecording(): boolean {
-    return this.recorder?.state === "started";
-  }
-
-  /** Continuous, called every video frame from the gesture loop. */
   setExpression(volume: number, rateIndex: number, vibratoAmt: number): void {
     if (!this.started) return;
     this.volume = this.editorMode ? Math.max(volume, 0.6) : volume;
     this.rateIndex = rateIndex;
-    // perceptual volume curve; fully closed fist is silence
-    const v = this.volume;
-    const gain = v < 0.06 ? 0 : Math.pow(v, 1.6);
-    this.gate.gain.rampTo(gain, 0.09);
-    this.vibrato.depth.rampTo(vibratoAmt * 0.45, 0.12);
+    const a = this.armed;
+    if (a) {
+      const v = this.volume;
+      a.gate.gain.rampTo(v < 0.06 ? 0 : Math.pow(v, 1.6), 0.09);
+      a.vibrato.depth.rampTo(vibratoAmt * 0.45, 0.12);
+    }
   }
 
   setVoicing(v: VoicingLevel): void {
     if (v !== this.voicing) {
       this.voicing = v;
-      this.chordDirty = true; // re-voice held chords at the next slot
+      this.chordDirty = true;
     }
   }
 
@@ -200,46 +481,12 @@ class AirloomEngine {
     this.velocity = v;
   }
 
-  async setInstrument(id: string): Promise<void> {
-    if (id === this.currentId) return;
-    let inst = this.instruments.get(id);
-    if (!inst) {
-      inst = await this.createInstrument(id);
-      this.instruments.set(id, inst);
-    }
-    this.releaseAll();
-    this.current?.disconnect();
-    this.current = inst;
-    this.currentId = id;
-    inst.connect(this.vibrato);
-  }
-
-  get instrumentId(): string {
-    return this.currentId;
-  }
-
-  private async createInstrument(id: string): Promise<Playable> {
-    if (id === "dream") {
-      const synth = new Tone.PolySynth(Tone.Synth, {
-        oscillator: { type: "fatsawtooth", count: 3, spread: 22 },
-        envelope: { attack: 0.04, decay: 0.3, sustain: 0.6, release: 1.6 },
-        volume: -8,
-      });
-      synth.maxPolyphony = 16;
-      return synth;
-    }
-    const set = SAMPLE_SETS[id];
-    const sampler = new Tone.Sampler({ urls: set.urls, baseUrl: set.baseUrl });
-    await Tone.loaded();
-    return sampler;
-  }
-
-  /* --------------------- the pattern player (audio clock) --------------------- */
-
+  /** The pattern player: full chords as one, at the hand-chosen rate. */
   private tick(time: number): void {
     const audible = this.volume >= 0.06;
-    if (!audible) {
-      if (this.wasAudible) this.releaseAll();
+    const a = this.armed;
+    if (!audible || !a?.playable) {
+      if (this.wasAudible) a?.playable?.releaseAll();
       this.wasAudible = false;
       return;
     }
@@ -250,63 +497,150 @@ class AirloomEngine {
 
     const stepsPerNote = STEPS_PER_RATE[this.rateIndex];
     const due = this.step % stepsPerNote === 0;
-    // fire immediately when the hand opens or the chord changes in slow modes,
-    // instead of waiting out a long subdivision
-    const force = (justOpened || this.chordDirty) && this.rateIndex <= 1;
-    if (!due && !force) {
-      if (this.chordDirty && this.rateIndex > 1) {
-        // arp modes just pick up the new chord on their next due note
-        this.arpIdx = 0;
-      }
-      return;
-    }
+    const force = justOpened || (this.chordDirty && this.rateIndex <= 1);
+    if (!due && !force) return;
     if (force) this.step = 0;
     this.chordDirty = false;
 
     const chordDef = this.chords[this.chordIndex];
     const notes = voiceChord(chordDef, this.voicing);
-    const inst = this.current;
-    if (!inst) return;
-
     const sixteenth = Tone.Time("16n").toSeconds();
     const vel = 0.25 + this.velocity * 0.75;
 
     if (this.rateIndex === 0) {
-      // HOLD: lush sustained chord, re-struck each bar
-      this.releaseAll(time);
-      inst.triggerAttackRelease(
-        notes.map(midiToFreq),
-        Tone.Time("1m").toSeconds(),
-        time,
-        vel,
-      );
+      // HOLD: sustained chord, re-struck each bar
+      a.playable.releaseAll(time);
+      a.playable.triggerAttackRelease(notes, Tone.Time("1m").toSeconds(), time, vel);
+      this.capture(time, notes, Tone.Time("1m").toSeconds(), vel);
     } else if (this.rateIndex === 1) {
-      // 1/2: gentle strum
+      // 1/2: gentle strum of the whole chord
       notes.forEach((midi, i) => {
-        inst.triggerAttackRelease(
-          midiToFreq(midi),
-          Tone.Time("2n").toSeconds(),
-          time + i * 0.028,
-          vel * (1 - i * 0.06),
-        );
+        a.playable!.triggerAttackRelease([midi], Tone.Time("2n").toSeconds(), time + i * 0.028, vel * (1 - i * 0.06));
       });
+      this.capture(time, notes, Tone.Time("2n").toSeconds(), vel);
     } else {
-      // arpeggio: cycle chord tones + octave sparkle on top
-      const pool = [...notes, notes[notes.length - 1] + 12];
-      const midi = pool[this.arpIdx % pool.length];
-      this.arpIdx++;
-      inst.triggerAttackRelease(
-        midiToFreq(midi),
-        sixteenth * stepsPerNote * 1.6,
-        time,
-        vel,
-      );
+      // rhythmic chord pulses — the chord always sounds as ONE
+      const dur = sixteenth * stepsPerNote * 0.92;
+      a.playable.triggerAttackRelease(notes, dur, time, vel);
+      this.capture(time, notes, dur, vel);
     }
   }
 
-  private releaseAll(time?: number): void {
-    this.current?.releaseAll(time);
+  private capture(_time: number, notes: number[], dur: number, vel: number): void {
+    if (!this.recTrack || this.recTrack !== this.armed) return;
+    const loopSecs = Tone.Time("1m").toSeconds() * this.loopBars;
+    const rel = (Tone.getTransport().seconds - this.recStart) % loopSecs;
+    this.recEvents.push({ time: Math.max(rel, 0), notes: [...notes], dur, vel });
   }
+
+  /* ------------------------------- recording ------------------------------- */
+
+  startRecording(): void {
+    if (this.recordFormat === "wav") this.wavRecorder.start(this.master);
+    else if (this.recorder.state !== "started") this.recorder.start();
+  }
+
+  async stopRecording(): Promise<{ blob: Blob; ext: string }> {
+    if (this.recordFormat === "wav") {
+      return { blob: this.wavRecorder.stop(this.master), ext: "wav" };
+    }
+    return { blob: await this.recorder.stop(), ext: "webm" };
+  }
+
+  /* -------------------------------- project -------------------------------- */
+
+  serialize(chords: Chord[], label: string, bpm: number): string {
+    return JSON.stringify({
+      version: 1,
+      app: "airloom",
+      bpm,
+      label,
+      chords,
+      loopBars: this.loopBars,
+      tracks: this.tracks.map((t) => ({
+        name: t.meta.name,
+        kind: t.meta.kind,
+        sourceId: t.meta.sourceId,
+        gain: t.meta.gain,
+        pan: t.meta.pan,
+        muted: t.meta.muted,
+        patch: t.patch,
+        fx: t.fx.params,
+        clip: t.clip,
+        sampleRoot: t.sampleRoot,
+        sample: t.sampleBuffer ? bufferToB64(t.sampleBuffer) : null,
+      })),
+    });
+  }
+
+  async load(json: string): Promise<{ chords: Chord[]; label: string; bpm: number }> {
+    const p = JSON.parse(json);
+    if (p.app !== "airloom") throw new Error("Not an Airloom project file");
+    // clear existing tracks
+    for (const t of [...this.tracks]) {
+      t.dispose();
+    }
+    this.tracks = [];
+    this.loopBars = p.loopBars ?? 4;
+    this.setChords(p.chords, true);
+    for (const st of p.tracks) {
+      const id = await this.addTrack(st.kind === "sampler" && !st.sample ? "sampled" : st.kind,
+        st.kind === "sampler" && !st.sample ? "piano" : st.sourceId, st.name);
+      const t = this.track(id)!;
+      if (st.kind === "synth" && st.patch) this.applyPatch(id, st.patch);
+      if (st.kind === "sampler" && st.sample) {
+        const buf = await b64ToBuffer(st.sample);
+        await this.setTrackSource(id, "sampler", st.sourceId, buf, st.sampleRoot);
+      }
+      t.fx.set(st.fx ?? structuredClone(DEFAULT_FX));
+      Object.assign(t.meta, { gain: st.gain, pan: st.pan, muted: st.muted });
+      if (st.clip?.length) {
+        t.clip = st.clip;
+        t.meta.hasClip = true;
+        if (this.isRunning) this.startClip(t);
+      }
+    }
+    if (this.tracks[0]) this.tracks[0].meta.armed = true;
+    this.applyMix();
+    this.emitTracks();
+    return { chords: p.chords, label: p.label ?? "My Weave", bpm: p.bpm ?? 100 };
+  }
+
+  restartClips(): void {
+    this.tracks.forEach((t) => {
+      if (t.clip?.length && !t.part) this.startClip(t);
+    });
+  }
+}
+
+/* --------------------------------- helpers --------------------------------- */
+
+function bufferToB64(buf: AudioBuffer): { rate: number; channels: string[] } {
+  const channels: string[] = [];
+  for (let c = 0; c < Math.min(buf.numberOfChannels, 2); c++) {
+    const f32 = buf.getChannelData(c);
+    const bytes = new Uint8Array(f32.buffer.slice(0));
+    let bin = "";
+    const CHUNK = 0x8000;
+    for (let i = 0; i < bytes.length; i += CHUNK) {
+      bin += String.fromCharCode(...bytes.subarray(i, i + CHUNK));
+    }
+    channels.push(btoa(bin));
+  }
+  return { rate: buf.sampleRate, channels };
+}
+
+async function b64ToBuffer(data: { rate: number; channels: string[] }): Promise<AudioBuffer> {
+  const ctx = Tone.getContext().rawContext;
+  const chans = data.channels.map((b64) => {
+    const bin = atob(b64);
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    return new Float32Array(bytes.buffer);
+  });
+  const buf = ctx.createBuffer(chans.length, chans[0].length, data.rate);
+  chans.forEach((c, i) => buf.copyToChannel(c, i));
+  return buf;
 }
 
 /** Singleton — one audio engine per page. */

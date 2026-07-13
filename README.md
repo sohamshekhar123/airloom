@@ -13,8 +13,10 @@ Airloom is a camera-powered instrument for people who've never opened a DAW, nev
 | 🫱 **Right hand — The Performer** | **Open your hand** to raise the volume (fist = silence). Move **side to side** to set the rhythm — from long held chords to sparkling 16th-note runs. Move **up** for vibrato. **Pinch** (thumb + index) to advance to the next chord. |
 | 🫲 **Left hand — The Conductor** | **Raise it** for richer, lusher chords; lower it for deep bass. **Pinch** and raise/lower to dial in note intensity — the value latches when you let go. |
 | 🧵 **The Loom — your chords** | Start from a preset progression (*Anthem*, *Heartache*, *Velvet*, *Daydream*, *Shadow*), then mix & match from a palette of common chords — or click notes on a piano roll to weave chords that are entirely yours. Everything stays in tune: **you cannot play a wrong note.** |
-| 🎹 **Real instruments** | Sampled grand piano, acoustic guitar, and harp (plus a dreamy synth), switchable live from the top bar. |
-| ⏺ **Record & save** | One-click audio recording — stop and it saves straight to a file. |
+| 🎹 **Real instruments** | Sampled grand piano, acoustic guitar, and harp — plus **AirSynth**, Airloom's own fully-editable synthesizer with a bank of 100 presets (oscillators, filter, envelope, LFO, glide — all yours to twist). |
+| 🎛 **The Studio** | Multi-track, Logic-style: every track has its own instrument, FX rack (chorus, pitch, drive, delay, reverb), volume, pan, mute and solo. **Loop-record** a part with your hands, it keeps playing, arm the next track, and layer up a whole song. |
+| 🎤 **Sampler** | Bring any sound — your voice, a pot lid, a dog bark. Airloom repitches it across the keyboard and your hands play chords with it. |
+| ⏺ **Record & save** | One-click audio recording in **lossless WAV** (or compact webm). Projects save to `.airloom` files so you can keep weaving across sessions. |
 
 ## Why it doesn't feel laggy (the interesting part)
 
