@@ -16,7 +16,7 @@ import {
   PROGRESSIONS,
   midiToFreq,
   voiceChord,
-  type Progression,
+  type Chord,
   type VoicingLevel,
 } from "../music/progressions";
 
@@ -28,7 +28,7 @@ export interface InstrumentDef {
 export const INSTRUMENTS: InstrumentDef[] = [
   { id: "piano", label: "Grand Piano" },
   { id: "guitar", label: "Acoustic Guitar" },
-  { id: "violin", label: "Violin" },
+  { id: "harp", label: "Harp" },
   { id: "dream", label: "Dream Synth" },
 ];
 
@@ -48,11 +48,13 @@ const SAMPLE_SETS: Record<string, { baseUrl: string; urls: Record<string, string
       A3: "A3.mp3", C4: "C4.mp3", E4: "E4.mp3", G4: "G4.mp3",
     },
   },
-  violin: {
-    baseUrl: "https://nbrosowsky.github.io/tonejs-instruments/samples/violin/",
+  harp: {
+    baseUrl: "https://nbrosowsky.github.io/tonejs-instruments/samples/harp/",
     urls: {
-      A3: "A3.mp3", C4: "C4.mp3", E4: "E4.mp3", G4: "G4.mp3",
-      A4: "A4.mp3", C5: "C5.mp3", E5: "E5.mp3", G5: "G5.mp3",
+      B1: "B1.mp3", D2: "D2.mp3", F2: "F2.mp3", A2: "A2.mp3",
+      C3: "C3.mp3", E3: "E3.mp3", G3: "G3.mp3", B3: "B3.mp3",
+      D4: "D4.mp3", F4: "F4.mp3", A4: "A4.mp3",
+      C5: "C5.mp3", E5: "E5.mp3", G5: "G5.mp3",
     },
   },
 };
@@ -64,8 +66,9 @@ type Playable = Tone.Sampler | Tone.PolySynth;
 
 class AirloomEngine {
   private started = false;
-  private progression: Progression = PROGRESSIONS[0];
+  private chords: Chord[] = PROGRESSIONS[0].chords;
   private chordIndex = 0;
+  private editorMode = false;
 
   // hand-driven expression (written every frame, read on audio ticks)
   private volume = 0; // 0..1 from right-hand openness
@@ -84,6 +87,7 @@ class AirloomEngine {
 
   private vibrato!: Tone.Vibrato;
   private gate!: Tone.Gain;
+  private recorder!: Tone.Recorder;
 
   onChord: ((name: string, index: number) => void) | null = null;
   onBeat: ((beat: number) => void) | null = null;
@@ -94,6 +98,8 @@ class AirloomEngine {
     await Tone.start();
 
     const reverb = new Tone.Reverb({ decay: 3.2, wet: 0.28 }).toDestination();
+    this.recorder = new Tone.Recorder();
+    reverb.connect(this.recorder);
     const limiter = new Tone.Limiter(-2).connect(reverb);
     const trim = new Tone.Volume(-4).connect(limiter);
     this.gate = new Tone.Gain(0).connect(trim);
@@ -113,7 +119,7 @@ class AirloomEngine {
   play(bpm: number): void {
     Tone.getTransport().bpm.value = bpm;
     Tone.getTransport().start();
-    this.onChord?.(this.progression.chords[this.chordIndex].name, this.chordIndex);
+    this.onChord?.(this.chords[this.chordIndex].name, this.chordIndex);
   }
 
   pause(): void {
@@ -129,28 +135,56 @@ class AirloomEngine {
     Tone.getTransport().bpm.rampTo(bpm, 0.4);
   }
 
-  setProgression(p: Progression): void {
-    this.progression = p;
-    this.chordIndex = 0;
+  /** Replace the working progression (from presets or the Loom editor). */
+  setChords(chords: Chord[], resetIndex = false): void {
+    this.chords = chords;
+    if (resetIndex || this.chordIndex >= chords.length) this.chordIndex = 0;
     this.chordDirty = true;
-    this.onChord?.(p.chords[0].name, 0);
+    this.onChord?.(chords[this.chordIndex].name, this.chordIndex);
   }
 
-  /** The invisible button: right hand pushes toward the camera. */
+  /** The invisible button: right hand pinches. */
   advanceChord(): void {
-    this.chordIndex = (this.chordIndex + 1) % this.progression.chords.length;
+    this.chordIndex = (this.chordIndex + 1) % this.chords.length;
     this.chordDirty = true;
     this.arpIdx = 0;
-    this.onChord?.(this.progression.chords[this.chordIndex].name, this.chordIndex);
+    this.onChord?.(this.chords[this.chordIndex].name, this.chordIndex);
+  }
+
+  /** While the Loom editor is open, keep the pattern audible even if the
+   *  hands are down, so edits are heard immediately. */
+  setEditorMode(on: boolean): void {
+    this.editorMode = on;
+    if (on && this.started) this.gate.gain.rampTo(0.6, 0.2);
+  }
+
+  /** Audition a single piano-key click through the current instrument. */
+  previewNote(midi: number): void {
+    this.current?.triggerAttackRelease(midiToFreq(midi), 0.5, Tone.now(), 0.8);
+  }
+
+  /* ------------------------------- recording ------------------------------- */
+
+  startRecording(): void {
+    if (this.recorder.state !== "started") this.recorder.start();
+  }
+
+  async stopRecording(): Promise<Blob> {
+    return this.recorder.stop();
+  }
+
+  get isRecording(): boolean {
+    return this.recorder?.state === "started";
   }
 
   /** Continuous, called every video frame from the gesture loop. */
   setExpression(volume: number, rateIndex: number, vibratoAmt: number): void {
     if (!this.started) return;
-    this.volume = volume;
+    this.volume = this.editorMode ? Math.max(volume, 0.6) : volume;
     this.rateIndex = rateIndex;
     // perceptual volume curve; fully closed fist is silence
-    const gain = volume < 0.06 ? 0 : Math.pow(volume, 1.6);
+    const v = this.volume;
+    const gain = v < 0.06 ? 0 : Math.pow(v, 1.6);
     this.gate.gain.rampTo(gain, 0.09);
     this.vibrato.depth.rampTo(vibratoAmt * 0.45, 0.12);
   }
@@ -229,7 +263,7 @@ class AirloomEngine {
     if (force) this.step = 0;
     this.chordDirty = false;
 
-    const chordDef = this.progression.chords[this.chordIndex];
+    const chordDef = this.chords[this.chordIndex];
     const notes = voiceChord(chordDef, this.voicing);
     const inst = this.current;
     if (!inst) return;

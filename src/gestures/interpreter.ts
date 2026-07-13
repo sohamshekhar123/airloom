@@ -5,7 +5,7 @@
  *   openness (fist..splayed)  -> volume, continuous
  *   x position                -> rhythm rate (hold / 1/2 / 1/4 / 1/8 / 1/16)
  *   y position                -> vibrato (pitch modulation), up = more
- *   z push toward camera      -> advance to the next chord (invisible button)
+ *   pinch (thumb+index)       -> advance to the next chord
  *
  * LEFT HAND — The Conductor (mint):
  *   y position                -> chord richness (bass / chord / lush)
@@ -13,7 +13,9 @@
  *                                LATCHES when the pinch releases
  *
  * All continuous controls are One Euro-filtered; discrete events (chord
- * push) use raw data + hysteresis so they stay snappy.
+ * advance) use raw data + hysteresis so they stay snappy. Volume openness
+ * deliberately ignores the index finger so a right-hand pinch doesn't
+ * dip the volume.
  */
 import { LM, type TrackedHand } from "../vision/tracker";
 import { OneEuroFilter } from "../vision/oneEuro";
@@ -32,10 +34,10 @@ export interface RightHandFrame {
   rateT: number;
   /** 0..1 vibrato amount */
   vibrato: number;
-  /** 0..1 how far into the chord-push the hand is (for HUD feedback) */
-  pushProgress: number;
-  /** true exactly once per push gesture */
-  pushed: boolean;
+  /** pinch currently held (for HUD) */
+  pinching: boolean;
+  /** true exactly once per pinch — advance the chord */
+  advanced: boolean;
   /** wrist position in mirrored screen space (for HUD) */
   x: number;
   y: number;
@@ -58,9 +60,9 @@ export interface GestureFrame {
   quality: number;
 }
 
-const PUSH_TRIGGER = 1.3; // hand scale ratio vs baseline to fire
-const PUSH_REARM = 1.12;
-const PUSH_DEBOUNCE_MS = 500;
+const PINCH_ON = 0.35; // thumb-index distance / palm size, engage below
+const PINCH_OFF = 0.55; // release above (hysteresis)
+const ADVANCE_DEBOUNCE_MS = 400;
 
 export class GestureInterpreter {
   private rOpen = new OneEuroFilter(1.5, 0.02);
@@ -68,10 +70,9 @@ export class GestureInterpreter {
   private rY = new OneEuroFilter(1.2, 0.01);
   private lY = new OneEuroFilter(1.2, 0.01);
 
-  private scaleBaseline: number | null = null;
-  private pushArmed = true;
-  private lastPushAt = 0;
-
+  private rPinched = false;
+  private lastAdvanceAt = 0;
+  private lPinched = false;
   private latchedVelocity = 0.8;
 
   update(hands: TrackedHand[], nowMs: number): GestureFrame {
@@ -82,61 +83,58 @@ export class GestureInterpreter {
     // ------------------------- RIGHT: The Performer -------------------------
     let right: RightHandFrame | null = null;
     if (rightHand) {
-      const lm = rightHand.landmarks;
-      const wrist = lm[LM.WRIST];
+      const wrist = rightHand.landmarks[LM.WRIST];
 
       const openness = this.rOpen.filter(handOpenness(rightHand), t);
       const x = this.rX.filter(wrist.x, t);
       const y = this.rY.filter(wrist.y, t);
 
-      // x -> rhythm rate across the performance zone
       const rateT = clamp01((x - HARMONY_ZONE_MAX_X) / (1 - HARMONY_ZONE_MAX_X));
       const rateIndex = Math.min(Math.floor(rateT * 5), 4);
-
-      // y -> vibrato, dead zone in the lower half so resting = clean
       const vibrato = clamp01((0.55 - y) / 0.45);
 
-      // z push: apparent hand size vs slow-adapting baseline
-      const scale = handScale(rightHand);
-      if (this.scaleBaseline === null) this.scaleBaseline = scale;
-      const ratio = scale / this.scaleBaseline;
-      // adapt baseline only when the hand is near rest depth
-      if (ratio < 1.1 && ratio > 0.85) {
-        this.scaleBaseline += (scale - this.scaleBaseline) * 0.03;
-      }
-      const pushProgress = clamp01((ratio - 1) / (PUSH_TRIGGER - 1));
-      let pushed = false;
-      if (
-        this.pushArmed &&
-        ratio > PUSH_TRIGGER &&
-        nowMs - this.lastPushAt > PUSH_DEBOUNCE_MS
-      ) {
-        pushed = true;
-        this.pushArmed = false;
-        this.lastPushAt = nowMs;
-      } else if (!this.pushArmed && ratio < PUSH_REARM) {
-        this.pushArmed = true;
+      // pinch -> next chord, with hysteresis + debounce
+      const pd = pinchDistance(rightHand);
+      let advanced = false;
+      if (!this.rPinched && pd < PINCH_ON) {
+        this.rPinched = true;
+        if (nowMs - this.lastAdvanceAt > ADVANCE_DEBOUNCE_MS) {
+          advanced = true;
+          this.lastAdvanceAt = nowMs;
+        }
+      } else if (this.rPinched && pd > PINCH_OFF) {
+        this.rPinched = false;
       }
 
-      right = { openness, rateIndex, rateT, vibrato, pushProgress, pushed, x, y };
+      right = {
+        openness,
+        rateIndex,
+        rateT,
+        vibrato,
+        pinching: this.rPinched,
+        advanced,
+        x,
+        y,
+      };
     } else {
       this.rOpen.reset();
       this.rX.reset();
       this.rY.reset();
-      this.scaleBaseline = null;
-      this.pushArmed = true;
+      this.rPinched = false;
     }
 
     // ------------------------- LEFT: The Conductor -------------------------
     let left: LeftHandFrame | null = null;
     if (leftHand) {
-      const lm = leftHand.landmarks;
-      const wrist = lm[LM.WRIST];
+      const wrist = leftHand.landmarks[LM.WRIST];
       const y = this.lY.filter(wrist.y, t);
       const height = 1 - clamp01(y);
-      const pinching = isPinching(leftHand);
 
-      if (pinching) {
+      const pd = pinchDistance(leftHand);
+      if (!this.lPinched && pd < PINCH_ON) this.lPinched = true;
+      else if (this.lPinched && pd > PINCH_OFF) this.lPinched = false;
+
+      if (this.lPinched) {
         // While pinched, height DIALS velocity; it stays after release.
         this.latchedVelocity = 0.15 + height * 0.85;
       }
@@ -145,13 +143,14 @@ export class GestureInterpreter {
       left = {
         height,
         voicing,
-        pinching,
+        pinching: this.lPinched,
         velocity: this.latchedVelocity,
         x: wrist.x,
         y,
       };
     } else {
       this.lY.reset();
+      this.lPinched = false;
     }
 
     const quality =
@@ -167,7 +166,7 @@ export class GestureInterpreter {
 
 const clamp01 = (v: number) => Math.min(Math.max(v, 0), 1);
 
-/** Palm size in screen units — grows as the hand nears the camera. */
+/** Palm size in screen units, for scale-invariant thresholds. */
 function handScale(hand: TrackedHand): number {
   const lm = hand.landmarks;
   const wrist = lm[LM.WRIST];
@@ -175,12 +174,15 @@ function handScale(hand: TrackedHand): number {
   return Math.hypot(mcp.x - wrist.x, mcp.y - wrist.y);
 }
 
-/** 0 = fist, 1 = fully splayed. Fingertip spread normalized by palm size. */
+/**
+ * 0 = fist, 1 = fully splayed. Uses middle/ring/pinky only, so pinching
+ * (thumb+index) doesn't read as "closing the hand".
+ */
 function handOpenness(hand: TrackedHand): number {
   const lm = hand.landmarks;
   const wrist = lm[LM.WRIST];
   const scale = handScale(hand) || 1e-6;
-  const tips = [LM.INDEX_TIP, LM.MIDDLE_TIP, LM.RING_TIP, LM.PINKY_TIP];
+  const tips = [LM.MIDDLE_TIP, LM.RING_TIP, LM.PINKY_TIP];
   let sum = 0;
   for (const tip of tips) {
     sum += Math.hypot(lm[tip].x - wrist.x, lm[tip].y - wrist.y);
@@ -190,13 +192,14 @@ function handOpenness(hand: TrackedHand): number {
   return clamp01((avg - 0.95) / 0.95);
 }
 
-/** Thumb tip touching index tip, normalized by palm size. */
-function isPinching(hand: TrackedHand): boolean {
+/** Thumb-index tip distance normalized by palm size. */
+function pinchDistance(hand: TrackedHand): number {
   const lm = hand.landmarks;
   const scale = handScale(hand) || 1e-6;
-  const d = Math.hypot(
-    lm[LM.THUMB_TIP].x - lm[LM.INDEX_TIP].x,
-    lm[LM.THUMB_TIP].y - lm[LM.INDEX_TIP].y,
+  return (
+    Math.hypot(
+      lm[LM.THUMB_TIP].x - lm[LM.INDEX_TIP].x,
+      lm[LM.THUMB_TIP].y - lm[LM.INDEX_TIP].y,
+    ) / scale
   );
-  return d / scale < 0.4;
 }

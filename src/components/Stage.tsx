@@ -44,7 +44,7 @@ export function Stage({ stream }: { stream: MediaStream }) {
       // ---- hands -> audio engine ----
       if (frame.right) {
         engine.setExpression(frame.right.openness, frame.right.rateIndex, frame.right.vibrato);
-        if (frame.right.pushed) {
+        if (frame.right.advanced) {
           engine.advanceChord();
           ripple.at = now;
           ripple.x = frame.right.x;
@@ -181,9 +181,9 @@ function draw(
     ctx.shadowBlur = 0;
   }
 
-  // ---- right-hand HUD: volume ring + push glow ----
+  // ---- right-hand HUD: volume ring + pinch indicator ----
   if (frame.right) {
-    const { x, y, openness, pushProgress } = frame.right;
+    const { x, y, openness, pinching } = frame.right;
     const cx = x * w;
     const cy = y * h;
     const r = 52;
@@ -202,15 +202,11 @@ function draw(
     ctx.stroke();
     ctx.shadowBlur = 0;
 
-    // z-push charge-up: amber ring tightens as the hand nears the camera
-    if (pushProgress > 0.15) {
-      ctx.lineWidth = 3;
-      ctx.strokeStyle = AMBER;
-      ctx.globalAlpha = pushProgress;
-      ctx.beginPath();
-      ctx.arc(cx, cy, r + 16 - pushProgress * 12, 0, Math.PI * 2);
-      ctx.stroke();
-      ctx.globalAlpha = 1;
+    if (pinching) {
+      ctx.fillStyle = AMBER;
+      ctx.font = "600 12px 'IBM Plex Mono', monospace";
+      ctx.textAlign = "center";
+      ctx.fillText("NEXT →", cx, cy - r - 12);
     }
   }
 

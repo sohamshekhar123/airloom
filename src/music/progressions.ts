@@ -89,6 +89,57 @@ export const PROGRESSIONS: Progression[] = [
   },
 ];
 
+/* ------------------------- chord palette & builders ------------------------- */
+
+type Quality = "maj" | "min" | "dom7" | "maj7" | "min7";
+
+/** Build a chord from a root (MIDI, octave 3) + quality, with consistent
+ *  bass/triad/extension voicings matching the hand-tuned presets above. */
+export function buildChord(name: string, root: number, quality: Quality): Chord {
+  const third = quality === "min" || quality === "min7" ? 3 : 4;
+  const seventh = quality === "maj" || quality === "maj7" ? 11 : 10;
+  return chord(
+    name,
+    root - 12,
+    [root, root + third, root + 7],
+    [root + seventh, root + 14],
+  );
+}
+
+/** Toggled piano notes -> a playable custom chord. */
+export function chordFromNotes(notes: number[]): Chord | null {
+  if (notes.length === 0) return null;
+  const sorted = [...notes].sort((a, b) => a - b);
+  return {
+    name: "MINE",
+    notes: {
+      bass: sorted[0] - 12,
+      triad: sorted,
+      extensions: [sorted[sorted.length - 1] + 12],
+    },
+  };
+}
+
+/** The mix-and-match palette: every chord a beginner will ever need. */
+export const CHORD_PALETTE: Chord[] = [
+  buildChord("C", 48, "maj"),
+  buildChord("Dm", 50, "min"),
+  buildChord("Em", 52, "min"),
+  buildChord("F", 53, "maj"),
+  buildChord("G", 55, "maj"),
+  buildChord("Am", 57, "min"),
+  buildChord("D", 50, "maj"),
+  buildChord("E", 52, "maj"),
+  buildChord("A", 57, "maj"),
+  buildChord("Bm", 59, "min"),
+  buildChord("Cmaj7", 48, "maj7"),
+  buildChord("Dm7", 50, "min7"),
+  buildChord("Em7", 52, "min7"),
+  buildChord("Fmaj7", 53, "maj7"),
+  buildChord("G7", 55, "dom7"),
+  buildChord("Am7", 57, "min7"),
+];
+
 /** Richness levels driven by the left hand's height. */
 export type VoicingLevel = 0 | 1 | 2; // 0 = bass only, 1 = chord, 2 = lush
 

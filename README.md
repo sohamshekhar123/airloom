@@ -10,10 +10,11 @@ Airloom is a camera-powered instrument for people who've never opened a DAW, nev
 
 | | |
 |---|---|
-| 🫱 **Right hand — The Performer** | **Open your hand** to raise the volume (fist = silence). Move **side to side** to set the rhythm — from long held chords to sparkling 16th-note runs. Move **up** for vibrato. **Push toward the camera** to advance to the next chord, like pressing an invisible button. |
-| 🫲 **Left hand — The Conductor** | **Raise it** for richer, lusher chords; lower it for deep bass. **Pinch** (thumb + index) and raise/lower to dial in note intensity — the value latches when you let go. |
-| 🎼 **Progressions, not theory** | Pick *Anthem*, *Heartache*, *Velvet*, *Daydream*, or *Shadow*. Airloom locks everything to voicings that always work — **you cannot play a wrong note.** |
-| 🎹 **Real instruments** | Sampled grand piano, acoustic guitar, and violin (plus a dreamy synth), switchable live from the top bar. |
+| 🫱 **Right hand — The Performer** | **Open your hand** to raise the volume (fist = silence). Move **side to side** to set the rhythm — from long held chords to sparkling 16th-note runs. Move **up** for vibrato. **Pinch** (thumb + index) to advance to the next chord. |
+| 🫲 **Left hand — The Conductor** | **Raise it** for richer, lusher chords; lower it for deep bass. **Pinch** and raise/lower to dial in note intensity — the value latches when you let go. |
+| 🧵 **The Loom — your chords** | Start from a preset progression (*Anthem*, *Heartache*, *Velvet*, *Daydream*, *Shadow*), then mix & match from a palette of common chords — or click notes on a piano roll to weave chords that are entirely yours. Everything stays in tune: **you cannot play a wrong note.** |
+| 🎹 **Real instruments** | Sampled grand piano, acoustic guitar, and harp (plus a dreamy synth), switchable live from the top bar. |
+| ⏺ **Record & save** | One-click audio recording — stop and it saves straight to a file. |
 
 ## Why it doesn't feel laggy (the interesting part)
 

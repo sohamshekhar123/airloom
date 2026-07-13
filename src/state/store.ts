@@ -5,7 +5,7 @@
  * so 60Hz hand motion doesn't become 60Hz React renders.
  */
 import { create } from "zustand";
-import { PROGRESSIONS } from "../music/progressions";
+import { PROGRESSIONS, type Chord } from "../music/progressions";
 
 export type Screen = "welcome" | "loading" | "stage" | "error";
 
@@ -24,13 +24,17 @@ interface PerfSnapshot {
 interface AirloomState extends PerfSnapshot {
   screen: Screen;
   errorMessage: string;
-  progressionId: string;
+  /** the working progression — editable in the Loom */
+  chords: Chord[];
+  progressionLabel: string;
   instrumentId: string;
-  instrumentLoading: boolean;
   bpm: number;
   playing: boolean;
   chordName: string;
   chordStep: number;
+  loomOpen: boolean;
+  selectedSlot: number;
+  recording: boolean;
 
   setScreen: (s: Screen, error?: string) => void;
   setPerf: (p: PerfSnapshot) => void;
@@ -42,13 +46,16 @@ const round = (v: number, q: number) => Math.round(v / q) * q;
 export const useStore = create<AirloomState>((set) => ({
   screen: "welcome",
   errorMessage: "",
-  progressionId: PROGRESSIONS[0].id,
+  chords: PROGRESSIONS[0].chords,
+  progressionLabel: PROGRESSIONS[0].label,
   instrumentId: "piano",
-  instrumentLoading: false,
   bpm: 100,
   playing: false,
   chordName: "",
   chordStep: 0,
+  loomOpen: false,
+  selectedSlot: 0,
+  recording: false,
 
   rightOn: false,
   leftOn: false,
